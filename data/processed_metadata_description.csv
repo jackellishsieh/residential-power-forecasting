@@ -1,0 +1,95 @@
+description,availability,type
+Which of the 3 data subsets this entry belongs to,1.0,location
+"The unique identifier for the home. To be more precise, this is the unique identifier for the home-resident pair. Thus, if a resident moves, the data collected from the house is associated with a new data ID.",1.0,dataid
+"This field will read Single-Family Home if this is a freestanding single-family home, Town Home if it is a home that shares at least one wall with a neighboring house, or Apartment if it is an apartment.",1.0,non-data-present
+participant's city,1.0,non-data-present
+participant's state,1.0,non-data-present
+"If eGauge electricity data is present, this field will show the minimum timestamp of the available data.",1.0,non-data-present
+"If eGauge electricity data is present, this field will show the maximum timestamp of the available data.",1.0,non-data-present
+This field shows how much one minute data  is available for each home.,1.0,non-data-present
+The date on which this participant enrolled with Pecan Street.,1.0,non-data-present
+The total square footage of the home.,0.9178082191780822,non-data-present
+The year in which this home was constructed.,0.7945205479452054,non-data-present
+"If eGauge electricity data is present in one second interval, this field will show the minimum timestamp of the available data.",0.726027397260274,non-data-present
+"If eGauge electricity data is present in one second interval, this field will show the maximum timestamp of the available data.",0.726027397260274,non-data-present
+This field shows how much one second data  is available for each home.,0.726027397260274,non-data-present
+this field will show yes if this participant is currently enrolled with Pecan Street and will be blank otherwise.,0.6027397260273972,non-data-present
+This field will show 'yes' if this participant has a solar photovoltaic system installed at their home and will be blank otherwise.,0.4794520547945205,non-data-present
+"The date on which this participant withdrew from participating with Pecan Street. If this field is blank, the participant is still enrolled.",0.3972602739726027,non-data-present
+The square footage of the first floor of the home.,0.3561643835616438,non-data-present
+"If ERT gas data is present, this field will show the minimum timestamp of the available data.",0.2465753424657534,non-data-present
+"If ERT gas data is present, this field will show the maximum timestamp of the available data.",0.2465753424657534,non-data-present
+This field shows how much gas data is available for each home.,0.2465753424657534,non-data-present
+"The square footage of the second floor of the home. If this field is blank and this home’s first floor square footage is indicated, there is no second floor. If the first floor square footage is not indicated, the number of floors of the home is unknown.",0.2465753424657534,non-data-present
+"The square footage of the third floor of the home. If this field is blank and this home’s first floor square footage is indicated, there is no third floor. If the first floor square footage is not indicated, the number of floors of the home is unknown.",0.2465753424657534,non-data-present
+Size of pv system.,0.2465753424657534,non-data-present
+pv_panel_direction. Direction solar panels are facing,0.2191780821917808,non-data-present
+Size of pv system facing south .,0.2054794520547945,non-data-present
+Size of pv system facing west .,0.1917808219178082,non-data-present
+"If indoor temperature sensor data is present, this field will show the minimum timestamp of the available data.",0.1506849315068493,non-data-present
+"If indoor temperature sensor data is present, this field will show the maximum timestamp of the available data.",0.1506849315068493,non-data-present
+This field shows how much indoor temperature data is available for each home.,0.1506849315068493,non-data-present
+"If ERT water data is present, this field will show the minimum timestamp of the available data.",0.136986301369863,non-data-present
+"If ERT water data is present, this field will show the maximum timestamp of the available data.",0.136986301369863,non-data-present
+This field shows how much water data is available for each home.,0.136986301369863,non-data-present
+"The square footage of a half floor in the home. If this field is blank and this home’s first floor square footage is indicated, there is no half floor. If the first floor square footage is not indicated, the number of floors of the home is unknown.",0.0684931506849315,non-data-present
+"The square footage of a lower level floor in the home. If this field is blank and this home’s first floor square footage is indicated, there is no lower level floor. If the first floor square footage is not indicated, the number of floors of the home is unknown.",0.0684931506849315,non-data-present
+"The number of Nest thermostats installed at the residence. If blank, this participant is not known to have a Nest thermostat in their home.",0.0273972602739726,non-data-present
+Size of pv system facing east .,0.0136986301369863,non-data-present
+eGauge data present measuring power drawn from or fed to the electrical grid.,0.8767123287671232,data-present
+Air compressor circuit eGauge data present.,0.7808219178082192,data-present
+Dishwasher circuit eGauge data present.,0.7671232876712328,data-present
+Furnace and air handler circuit eGauge data present.,0.7397260273972602,data-present
+Refrigerator circuit eGauge data present.,0.7123287671232876,data-present
+"First kitchen small appliance circuit eGauge data present. This type of circuit includes only wall outlets in the kitchen, and so may include toasters, coffee makers, blenders, etc.",0.7123287671232876,data-present
+Microwave circuit eGauge data present.,0.6301369863013698,data-present
+Stand-alone clothes washing machine eGauge data present.,0.5342465753424658,data-present
+Kitchen sink garbage disposal circuit eGauge data present.,0.5342465753424658,data-present
+Oven circuit eGauge data present.,0.5205479452054794,data-present
+"Second kitchen small appliance circuit eGauge data present. This type of circuit includes only wall outlets in the kitchen, and so may include toasters, coffee makers, blenders, etc.",0.4794520547945205,data-present
+eGauge data present for power generated by a solar photovoltaic system.,0.4383561643835616,data-present
+Electricity -powered clothes dryer (240V circuit) eGauge data present.,0.3698630136986301,data-present
+"Living room circuit eGauge data present. This type of circuit includes only lights, fans, and wall outlets.",0.3013698630136986,data-present
+Clothes washing machine and natural gas-powered dryer circuit eGauge data present.,0.2602739726027397,data-present
+"General lighting and plugs circuit eGauge data present. This type of circuit includes lights, fans, and wall outlets, often from multiple rooms in the home.",0.2328767123287671,data-present
+"Natural gas-powered clothes dryer (120V circuit) eGauge data present. The eGauge will only pick up the electricity use from the dryer’s drum rotation, not the gas heating signature.",0.2328767123287671,data-present
+Electric vehicle charger eGauge data present for first car.,0.2054794520547945,data-present
+"First bedroom circuit eGauge data present. This type of circuit includes only lights, fans, and wall outlets.",0.1917808219178082,data-present
+"First bathroom circuit eGauge data present. This type of circuit includes only lights, fans, and wall outlets.",0.1643835616438356,data-present
+"Second general lighting and plugs circuit eGauge data present. This type of circuit includes lights, fans, and wall outlets, often from multiple rooms in the home.",0.136986301369863,data-present
+"Garage circuit eGauge data present. This type of circuit includes only lights, fans, and wall outlets.",0.1232876712328767,data-present
+Stand-alone freezer circuit eGauge data present.,0.1095890410958904,data-present
+Range (either a stand-alone cooktop or a cooktop and an oven) circuit eGauge data present.,0.1095890410958904,data-present
+"Kitchen circuit eGauge data present. This type of circuit includes only lights, fans, and wall outlets.",0.0958904109589041,data-present
+Vent hood circuit eGauge data present.,0.0958904109589041,data-present
+Electric water heater eGauge data present.,0.0821917808219178,data-present
+"eGauge data present for electric stand alone heater. Can include dedicated circuit space heaters, baseboard heaters, electric radiant floor heating.",0.0821917808219178,data-present
+"Second bedroom circuit eGauge data present. This type of circuit includes only lights, fans, and wall outlets.",0.0684931506849315,data-present
+"Third general lighting and plugs circuit eGauge data present. This type of circuit includes lights, fans, and wall outlets, often from multiple rooms in the home.",0.0684931506849315,data-present
+Utility room circuit eGauge data present.,0.0547945205479452,data-present
+"Dining room circuit eGauge data present. This type of circuit includes only lights, fans, and wall outlets.",0.0547945205479452,data-present
+Second air compressor circuit eGauge data present.,0.0547945205479452,data-present
+Jacuzzi bathtub or hot tub eGauge data present.,0.0410958904109589,data-present
+Wine cooler circuit eGauge data present.,0.0410958904109589,data-present
+"eGauge data present for any type of pump that is not a pool pump. Not used to pump wells, sewers, or pools.",0.0410958904109589,data-present
+"Home office circuit eGauge data present. This type of circuit includes only lights, fans, and wall outlets. Computers may be common devices plugged into included any wall outlets included on this type of circuit.",0.0410958904109589,data-present
+Second furnace and air handler eGauge data present.,0.0410958904109589,data-present
+Sprinkler system circuit eGauge data present.,0.0273972602739726,data-present
+"Additional kitchen circuit eGauge data present. This type of circuit includes only lights, fans, and wall outlets.",0.0273972602739726,data-present
+"Third bedroom circuit eGauge data present. This type of circuit includes only lights, fans, and wall outlets.",0.0273972602739726,data-present
+"Second bathroom circuit eGauge data present. This type of circuit includes only lights, fans, and wall outlets.",0.0273972602739726,data-present
+"eGauge data present for a pump used to remove water that has accumulated in a water-collecting sump basin, commonly found in the basement of homes.",0.0136986301369863,data-present
+Exterior lighting and plugs circuit eGauge data present.,0.0136986301369863,data-present
+eGauge data present for water pump to pump water out of water well.,0.0136986301369863,data-present
+Second electric water heater eGauge data present.,0.0136986301369863,data-present
+Second oven circuit eGauge data present.,0.0136986301369863,data-present
+eGauge data present for a dedicated circuit monitoring sewer pump. If If house is not connected to city service it is a sewer pump for pumping into a septic tank.,0.0136986301369863,data-present
+Electric vehicle charger eGauge data present for second car.,0.0136986301369863,data-present
+Window unit air conditioner circuit eGauge data present.,0.0136986301369863,data-present
+Whole home fan circuit eGauge data present.,0.0136986301369863,data-present
+eGauge data present for power generated by second solar photovoltaic system.,0.0136986301369863,data-present
+Security system circuit eGauge data present.,0.0136986301369863,data-present
+"eGauge data present for a pump used to circulate gasses,liquids, or slurries in a closed circuit. They are commonly found circulating water in a hydronic heating or cooling system.",0.0136986301369863,data-present
+"Fourth general lighting and plugs circuit eGauge data present. This type of circuit includes lights, fans, and wall outlets, often from multiple rooms in the home.",0.0136986301369863,data-present
+Second refrigerator circuit eGauge data present.,0.0136986301369863,data-present
+"eGauge data present for second electric stand alone heater. Can include dedicated circuit space heaters, baseboard heaters, electric radiant floor heating.",0.0136986301369863,data-present
