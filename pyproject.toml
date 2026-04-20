@@ -9,4 +9,5 @@ dependencies = [
     "jupyter",
     "matplotlib>=3.10.8",
     "pandas>=3.0.2",
+    "seaborn>=0.13.2",
 ]
