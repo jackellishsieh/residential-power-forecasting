@@ -60,6 +60,7 @@ for city in CITIES:
         )
         home_df = home_df[[d not in dst_transition_days for d in local_dates]]
 
+        home_df = home_df.astype("float32")
         dataset[dataid] = (has_car, city, home_df)
 
 with open(OUT_PATH, "wb") as f:
