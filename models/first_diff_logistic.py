@@ -10,7 +10,7 @@ Probabilistic forecast of EV ownership from a home's load signal.
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score
 
 
 def estimate_ev_state(
@@ -54,7 +54,7 @@ def tune(train_homes: dict) -> tuple[LogisticRegression, int, float, float]:
     y = np.array([int(has_car) for _, (has_car, _, _) in train_homes.items()])
 
     best_auroc, best = -1.0, None
-    for w in [2, 4, 6, 8]:
+    for w in [2, 4, 8, 16, 24, 48]:
         for lo in np.arange(0.4, 1.6, 0.2):
             for hi in np.arange(1.2, 3.2, 0.2):
                 if hi <= lo:
@@ -63,7 +63,7 @@ def tune(train_homes: dict) -> tuple[LogisticRegression, int, float, float]:
                 model = LogisticRegression(class_weight="balanced", max_iter=1000).fit(
                     X, y
                 )
-                score = roc_auc_score(y, model.predict_proba(X)[:, 1])
+                score = average_precision_score(y, model.predict_proba(X)[:, 1])
                 if score > best_auroc:
                     best_auroc, best = score, (w, lo, hi)
 
