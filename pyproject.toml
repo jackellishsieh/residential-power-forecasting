@@ -9,5 +9,6 @@ dependencies = [
     "jupyter",
     "matplotlib>=3.10.8",
     "pandas>=3.0.2",
+    "scikit-learn>=1.8.0",
     "seaborn>=0.13.2",
 ]
