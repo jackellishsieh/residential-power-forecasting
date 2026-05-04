@@ -104,11 +104,14 @@ class HomeInference:
     alpha_samples: np.ndarray | None = None      # (S,)
     theta_samples: np.ndarray | None = None      # (S, K)
 
-    # Per-sample C indicator: 1 if any z[d,t] != off in that sample
-    c_from_z_samples: np.ndarray | None = None          # (S,) binary
+    # Per-sample C drawn from the Gibbs chain  (primary C estimate)
+    c_samples: np.ndarray | None = None                       # (S,) int {0, 1}
+
+    # Per-sample C indicator: 1 if any z[d,t] != off in that sample (derived)
+    c_from_z_samples: np.ndarray | None = None                # (S,) binary
 
     # Per-sample within-day z transition rate (for heuristic-based C estimation)
-    z_transitions_per_day_samples: np.ndarray | None = None  # (S,) float
+    z_transitions_per_day_samples: np.ndarray | None = None   # (S,) float
 
     # Full iteration traces (burn-in + retained), for convergence diagnostics
     alpha_trace: np.ndarray | None = None        # (S_burn + S,)
@@ -487,7 +490,6 @@ def _charging_loglik(n, theta_hat, S_y, SS_y, mu, sig2_theta, sig2_ev, active):
 def infer_home(
     home_x: np.ndarray,
     params: ModelParams,
-    C_hat: int,
     *,
     S_burn: int = 200,
     S: int = 500,
@@ -495,14 +497,31 @@ def infer_home(
     home_id: int = -1,
     verbose: bool = True,
     record_traces: bool = True,
+    initial_c: int = 1,
+    initial_z: np.ndarray | None = None,
+    c_logistic_model=None,   # fitted sklearn LogisticRegression from first_diff_logistic.tune()
 ) -> HomeInference:
-    """Run Gibbs inference for one home.
+    """Mixture Gibbs inference for one home.  C is sampled in the chain.
 
-    home_x       : (D, T) total load.
-    C_hat        : if 0, skip Gibbs and return z≡off.  Pass 1 to run Gibbs
-                   regardless and derive C probability from the sampled z's.
-    record_traces: store full per-iteration alpha/theta/loglik traces for
-                   convergence diagnostics (adds ~negligible memory for 700 iters).
+    home_x           : (D, T) total load — the ONLY signal used at test time.
+    initial_c        : warm-start C value (0 or 1); chain mixes away after burn-in.
+    initial_z        : (D, T) warm-start z; defaults to all-off if None.
+    c_logistic_model : if provided, C is sampled each iteration from
+                       Bernoulli(logistic(transitions_per_day(z))).
+                       If None, falls back to a hard threshold at 1 transition/day.
+
+    Why logistic on transitions, not "any z≠off"?
+      P(z=all-off | D≈360 days, C=1) ≈ 0.25^360 ≈ 0, so the any-non-off rule
+      fires every iteration for all homes, making C≡1 and defeating inference.
+      Transitions/day measures *concentrated* charging patterns (EV homes have
+      sustained charging blocks → many transitions) vs scattered noise (non-EV
+      homes have occasional HMM artefacts → few transitions).
+
+    Gibbs blocks per iteration:
+      1. z  | C-marginalised, α, Θ, x  — mixture FFBS (collapsed sampler)
+      2. C  | z                         — Bernoulli from logistic(transitions/day)
+      3. Θ_k | z, α, x                 — conjugate Gaussian (prior if no state-k obs)
+      4. α  | z, Θ, x                  — conjugate Gaussian (always)
     """
     if rng is None:
         rng = np.random.default_rng(0)
@@ -510,75 +529,87 @@ def infer_home(
     D, T_ = home_x.shape
     assert T_ == T, f"expected T={T}, got {T_}"
 
-    if C_hat == 0:
-        if verbose:
-            print(f"  [home {home_id}] C_hat=0 → z ≡ off (no Gibbs)")
-        return HomeInference(
-            home_id=home_id,
-            C_hat=0,
-            z_hat=np.zeros((D, T), dtype=np.int64),
-            S_burn=S_burn,
-        )
-
     if verbose:
-        print(f"  [home {home_id}] C_hat=1, D={D} → "
-              f"running Gibbs ({S_burn} burn-in + {S} retained)")
+        print(f"  [home {home_id}] D={D} → "
+              f"mixture Gibbs ({S_burn} burn-in + {S} retained)  "
+              f"initial_c={initial_c}")
 
     # ── initialise ────────────────────────────────────────────────────────────
     alpha = params.mu_alpha
     theta = params.mu_theta.copy()
-    z     = np.zeros((D, T), dtype=np.int64)
+    z     = initial_z.copy() if initial_z is not None else np.zeros((D, T), dtype=np.int64)
+    c     = initial_c
 
     log_pi = np.log(params.pi_z + 1e-300)
     log_P  = np.log(params.P_z  + 1e-300)
 
     # ── storage ───────────────────────────────────────────────────────────────
-    n_total = S_burn + S
-    z_counts                       = np.zeros((D, T, K), dtype=np.float64)
-    alpha_samples                  = np.zeros(S,         dtype=np.float64)
-    theta_samples                  = np.zeros((S, K),    dtype=np.float64)
-    c_from_z_samples               = np.zeros(S,         dtype=np.int8)
-    z_transitions_per_day_samples  = np.zeros(S,         dtype=np.float64)
+    n_total                       = S_burn + S
+    z_counts                      = np.zeros((D, T, K), dtype=np.float64)
+    alpha_samples                 = np.zeros(S,         dtype=np.float64)
+    theta_samples                 = np.zeros((S, K),    dtype=np.float64)
+    c_samples                     = np.zeros(S,         dtype=np.int8)
+    c_from_z_samples              = np.zeros(S,         dtype=np.int8)
+    z_transitions_per_day_samples = np.zeros(S,         dtype=np.float64)
 
     if record_traces:
-        alpha_trace     = np.zeros(n_total,       dtype=np.float64)
-        theta_trace     = np.zeros((n_total, K),  dtype=np.float64)
-        state_occ_trace = np.zeros((n_total, K),  dtype=np.float64)
-        loglik_trace    = np.zeros(n_total,       dtype=np.float64)
+        alpha_trace     = np.zeros(n_total,      dtype=np.float64)
+        theta_trace     = np.zeros((n_total, K), dtype=np.float64)
+        state_occ_trace = np.zeros((n_total, K), dtype=np.float64)
+        loglik_trace    = np.zeros(n_total,      dtype=np.float64)
     else:
         alpha_trace = theta_trace = state_occ_trace = loglik_trace = None
 
     # ── main loop ─────────────────────────────────────────────────────────────
     t_start = time.time()
+    s_idx   = -1
 
     for it in range(n_total):
-        # Block 1 — FFBS: sample z
-        z = _ffbs(home_x, theta, alpha, params, log_pi, log_P, rng)
 
-        # Block 2 — sample Theta_k (k = low, high); off is fixed at 0
+        # Block 1 — mixture FFBS: sample z marginalising over C ───────────────
+        z_candidate, log_Z1 = _ffbs(home_x, theta, alpha, params, log_pi, log_P, rng)
+
+        log_Z0  = _compute_loglik_c0(home_x, alpha, params)
+        log_w1  = np.log(params.p_C + 1e-300)     + log_Z1
+        log_w0  = np.log(1 - params.p_C + 1e-300) + log_Z0
+        p_c1_eff = float(np.exp(log_w1 - float(np.logaddexp(log_w1, log_w0))))
+
+        z = z_candidate if rng.random() < np.clip(p_c1_eff, 0.0, 1.0)             else np.zeros((D, T), dtype=np.int64)
+
+        # Block 2 — sample C | z via transitions/day ─────────────────────────
+        # Transitions/day captures sustained charging blocks (EV) vs scattered
+        # HMM artefacts (non-EV), avoiding the any-non-off rule that fires for
+        # every home since z=all-off is astronomically unlikely for D≈360 days.
+        transitions_per_day_now = float((np.diff(z, axis=1) != 0).sum() / D)
+        if c_logistic_model is not None:
+            p_c1 = float(c_logistic_model.predict_proba([[transitions_per_day_now]])[0, 1])
+        else:
+            p_c1 = float(transitions_per_day_now > 1.0)   # hard threshold fallback
+        c = int(rng.random() < p_c1)
+
+        # Block 3 — sample Θ_k (draws from prior when z=all-off) ─────────────
         for k in (1, 2):
             theta[k] = _sample_theta_k(home_x, z, alpha, params, k, rng)
 
-        # Block 3 — sample alpha
+        # Block 4 — sample α (always) ─────────────────────────────────────────
         alpha = _sample_alpha(home_x, z, theta, params, rng)
 
-        # ── record traces (every iteration) ───────────────────────────────────
+        # ── record traces ─────────────────────────────────────────────────────
         if record_traces:
-            alpha_trace[it]        = alpha
-            theta_trace[it]        = theta
-            state_occ_trace[it]    = [(z == k).mean() for k in range(K)]
-            loglik_trace[it]       = _compute_loglik(home_x, z, theta, alpha, params)
+            alpha_trace[it]     = alpha
+            theta_trace[it]     = theta
+            state_occ_trace[it] = [(z == k).mean() for k in range(K)]
+            loglik_trace[it]    = _compute_loglik(home_x, z, theta, alpha, params)
 
-        # ── accumulate post-burn-in quantities ────────────────────────────────
+        # ── accumulate post-burn-in ───────────────────────────────────────────
         if it >= S_burn:
             s_idx = it - S_burn
             alpha_samples[s_idx] = alpha
             theta_samples[s_idx] = theta
+            c_samples[s_idx]     = c
             for k in range(K):
                 z_counts[:, :, k] += (z == k)
-            # C probability: 1 if any z != off in this sample
-            c_from_z_samples[s_idx] = int(np.any(z != 0))
-            # Within-day transition rate for heuristic-based C estimation
+            c_from_z_samples[s_idx]              = int(np.any(z != 0))
             z_transitions_per_day_samples[s_idx] = float(
                 (np.diff(z, axis=1) != 0).sum() / D
             )
@@ -587,52 +618,47 @@ def infer_home(
         if verbose and (it < 3 or it == S_burn or (it + 1) % 100 == 0):
             phase   = "burn-in" if it < S_burn else "keep  "
             elapsed = time.time() - t_start
-
-            # Running-mean convergence signal: change in alpha mean over last 50 retained
-            if it >= S_burn + 50:
-                recent_alpha = alpha_samples[max(0, s_idx - 49) : s_idx + 1]
-                delta_pct = abs(recent_alpha[-1] - recent_alpha[0]) / (recent_alpha.std() + 1e-9) * 100
-                conv_flag = f"  Δα/σ={delta_pct:.1f}%"
-            else:
-                conv_flag = ""
-
+            conv_flag = ""
+            if s_idx >= 50:
+                window    = alpha_samples[max(0, s_idx - 49): s_idx + 1]
+                conv_flag = f"  Δα/σ={abs(window[-1]-window[0])/(window.std()+1e-9)*100:.0f}%"
+            ll = loglik_trace[it] if record_traces else float("nan")
             print(f"    iter {it+1:4d}/{n_total} [{phase}]  "
-                  f"α={alpha:.3f}  Θ_low={theta[1]:.3f}  Θ_high={theta[2]:.3f}  "
-                  f"logL={loglik_trace[it] if record_traces else float('nan'):.1f}  "
-                  f"({elapsed:.1f}s){conv_flag}")
+                  f"C={c}  α={alpha:.3f}  Θ_low={theta[1]:.3f}  Θ_high={theta[2]:.3f}  "
+                  f"logL={ll:.1f}  ({elapsed:.1f}s){conv_flag}")
 
     # ── final summaries ───────────────────────────────────────────────────────
-    z_marginals      = z_counts / S
-    z_hat            = np.argmax(z_marginals, axis=2)
-    c_hat_prob       = float(c_from_z_samples.mean())
+    z_marginals = z_counts / S
+    z_hat       = np.argmax(z_marginals, axis=2)
+    c_hat_prob  = float(c_samples.mean())
 
     if verbose:
         elapsed = time.time() - t_start
         frac = z_marginals.mean(axis=(0, 1))
-        print(f"\n  [home {home_id}] Gibbs done in {elapsed:.1f}s")
-        print(f"    posterior state freq : off={frac[0]:.3f}  low={frac[1]:.3f}  high={frac[2]:.3f}")
-        print(f"    P̂(C=1) from z samples: {c_hat_prob:.4f}")
-        print(f"    α  posterior : mean={alpha_samples.mean():.3f}  std={alpha_samples.std():.4f}")
+        print(f"\n  [home {home_id}] done in {elapsed:.1f}s")
+        print(f"    P̂(C=1) from chain : {c_hat_prob:.4f}  (hard={int(c_hat_prob >= 0.5)})")
+        print(f"    z freq : off={frac[0]:.3f}  low={frac[1]:.3f}  high={frac[2]:.3f}")
+        print(f"    α : mean={alpha_samples.mean():.3f}  std={alpha_samples.std():.4f}")
         for k in (1, 2):
-            print(f"    Θ[{STATE_NAMES[k]:>4}] posterior : "
-                  f"mean={theta_samples[:, k].mean():.3f}  std={theta_samples[:, k].std():.4f}")
+            print(f"    Θ[{STATE_NAMES[k]:>4}] : "
+                  f"mean={theta_samples[:,k].mean():.3f}  std={theta_samples[:,k].std():.4f}")
 
     return HomeInference(
-        home_id          = home_id,
-        C_hat            = C_hat,
-        z_hat            = z_hat,
-        z_marginals      = z_marginals,
-        alpha_samples    = alpha_samples,
-        theta_samples    = theta_samples,
+        home_id                       = home_id,
+        C_hat                         = int(c_hat_prob >= 0.5),
+        z_hat                         = z_hat,
+        z_marginals                   = z_marginals,
+        alpha_samples                 = alpha_samples,
+        theta_samples                 = theta_samples,
+        c_samples                     = c_samples,
         c_from_z_samples              = c_from_z_samples,
         z_transitions_per_day_samples = z_transitions_per_day_samples,
-        alpha_trace      = alpha_trace,
-        theta_trace      = theta_trace,
-        state_occ_trace  = state_occ_trace,
-        loglik_trace     = loglik_trace,
-        S_burn           = S_burn,
+        alpha_trace                   = alpha_trace,
+        theta_trace                   = theta_trace,
+        state_occ_trace               = state_occ_trace,
+        loglik_trace                  = loglik_trace,
+        S_burn                        = S_burn,
     )
-
 
 # ---------------------------------------------------------------------------
 # Gibbs helpers
@@ -646,9 +672,26 @@ def _compute_loglik(
     params: ModelParams,
 ) -> float:
     """Complete-data log-likelihood: Σ_{d,t} log N(x[d,t]; θ_{z[d,t]} + α·ρ_t, σ²_{z[d,t],t})."""
-    combined_var = params.sigma2_ev[z] + params.sigma2_nonev[None, :]   # (D, T)
-    mean_dt      = theta[z] + alpha * params.rho[None, :]               # (D, T)
+    combined_var = params.sigma2_ev[z] + params.sigma2_nonev[None, :]
+    mean_dt      = theta[z] + alpha * params.rho[None, :]
     ll           = -0.5 * (np.log(2 * np.pi * combined_var) + (x - mean_dt) ** 2 / combined_var)
+    return float(ll.sum())
+
+
+def _compute_loglik_c0(
+    x: np.ndarray,   # (D, T)
+    alpha: float,
+    params: ModelParams,
+) -> float:
+    """log p(x | C=0, α) = log p(x | z≡off, α).
+
+    Under C=0, z is always off, so the emission is
+    N(x[d,t]; 0 + α·ρ_t, σ²_{EV,off} + σ²_{NonEV,t}).
+    """
+    combined_var_off = params.sigma2_ev[0] + params.sigma2_nonev          # (T,)
+    residual         = x - alpha * params.rho[None, :]                    # (D, T)
+    ll = -0.5 * (np.log(2 * np.pi * combined_var_off[None, :])
+                 + residual ** 2 / combined_var_off[None, :])
     return float(ll.sum())
 
 
@@ -656,58 +699,60 @@ def _compute_loglik(
 # Gibbs blocks
 # ---------------------------------------------------------------------------
 
-def _ffbs(x, theta, alpha, params, log_pi, log_P, rng):
-    """Forward-filter backward-sample. Vectorized over days.
+def _ffbs(
+    x, theta, alpha, params, log_pi, log_P, rng
+) -> tuple[np.ndarray, float]:
+    """Forward-filter backward-sample, vectorized over days.
 
-    x: (D, T). Returns z: (D, T) int.
+    Returns (z, log_Z1) where:
+      z       : (D, T) sampled state sequence
+      log_Z1  : log p(x | C=1, α, θ) — the marginal likelihood under the EV HMM,
+                accumulated as the sum of per-step log-normalisation constants.
+                Used by the mixture sampler to weight C=1 vs C=0.
     """
     D = x.shape[0]
-    rho = params.rho                                     # (T,)
-    sigma2_nonev = params.sigma2_nonev                   # (T,)
-    sigma2_ev = params.sigma2_ev                         # (K,)
+    rho          = params.rho
+    sigma2_nonev = params.sigma2_nonev
+    sigma2_ev    = params.sigma2_ev
 
-    # Combined variance per (k, t): (K, T)
-    combined_var = sigma2_ev[:, None] + sigma2_nonev[None, :]
-    inv_2var = 0.5 / combined_var
-    log_norm = -0.5 * np.log(2 * np.pi * combined_var)   # (K, T)
+    combined_var = sigma2_ev[:, None] + sigma2_nonev[None, :]     # (K, T)
+    inv_2var     = 0.5 / combined_var
+    log_norm     = -0.5 * np.log(2 * np.pi * combined_var)        # (K, T)
 
-    # mean[k, t] = theta[k] + alpha * rho[t]
-    mean_kt = theta[:, None] + alpha * rho[None, :]      # (K, T)
+    mean_kt  = theta[:, None] + alpha * rho[None, :]              # (K, T)
+    diff     = x[:, :, None] - mean_kt.T[None, :, :]             # (D, T, K)
+    log_emit = log_norm.T[None, :, :] - diff ** 2 * inv_2var.T[None, :, :]  # (D, T, K)
 
-    # log_emit[d, t, k] = log N(x[d,t]; mean[k,t], combined_var[k,t])
-    # Compute as (D, T, K)
-    diff = x[:, :, None] - mean_kt.T[None, :, :]         # (D, T, K)
-    log_emit = log_norm.T[None, :, :] - (diff ** 2) * inv_2var.T[None, :, :]  # (D, T, K)
+    # ── forward pass — accumulate log_Z1 ─────────────────────────────────────
+    log_f  = np.empty((D, T, K), dtype=np.float64)
+    log_Z1 = 0.0
 
-    # Forward pass
-    log_f = np.empty((D, T, K), dtype=np.float64)
-    log_f[:, 0, :] = log_pi[None, :] + log_emit[:, 0, :]
-    log_f[:, 0, :] -= logsumexp(log_f[:, 0, :], axis=1, keepdims=True)
+    unnorm_0      = log_pi[None, :] + log_emit[:, 0, :]           # (D, K)
+    lse_0         = logsumexp(unnorm_0, axis=1)                   # (D,)
+    log_Z1       += lse_0.sum()
+    log_f[:, 0, :] = unnorm_0 - lse_0[:, None]
+
     for t in range(1, T):
-        # log_pred[d, k'] = LSE_k(log_f[d, t-1, k] + log_P[k, k'])
-        # broadcast: log_f[..., :, None] (D,K,1) + log_P[None, :, :] (1,K,K)
-        log_pred = logsumexp(
-            log_f[:, t-1, :, None] + log_P[None, :, :], axis=1
-        )  # (D, K)
-        log_f[:, t, :] = log_emit[:, t, :] + log_pred
-        log_f[:, t, :] -= logsumexp(log_f[:, t, :], axis=1, keepdims=True)
+        log_pred    = logsumexp(log_f[:, t-1, :, None] + log_P[None, :, :], axis=1)
+        unnorm_t    = log_emit[:, t, :] + log_pred                # (D, K)
+        lse_t       = logsumexp(unnorm_t, axis=1)                 # (D,)
+        log_Z1     += lse_t.sum()
+        log_f[:, t, :] = unnorm_t - lse_t[:, None]
 
-    # Backward sample
-    z = np.empty((D, T), dtype=np.int64)
-    # t = T-1
-    p_last = np.exp(log_f[:, T-1, :])                                   # (D, K)
-    p_last /= p_last.sum(axis=1, keepdims=True)
-    z[:, T-1] = _sample_categorical_rows(p_last, rng)
+    # ── backward sample ───────────────────────────────────────────────────────
+    z     = np.empty((D, T), dtype=np.int64)
+    p_T   = np.exp(log_f[:, T-1, :])
+    p_T  /= p_T.sum(axis=1, keepdims=True)
+    z[:, T-1] = _sample_categorical_rows(p_T, rng)
 
     P_z = params.P_z
     for t in range(T - 2, -1, -1):
-        # weights[d, k] = exp(log_f[d, t, k]) * P_z[k, z[d, t+1]]
-        col = P_z[:, z[:, t+1]].T                                        # (D, K)
-        w = np.exp(log_f[:, t, :]) * col
-        w /= w.sum(axis=1, keepdims=True)
+        col = P_z[:, z[:, t+1]].T                                 # (D, K)
+        w   = np.exp(log_f[:, t, :]) * col
+        w  /= w.sum(axis=1, keepdims=True)
         z[:, t] = _sample_categorical_rows(w, rng)
 
-    return z
+    return z, log_Z1
 
 
 def _sample_categorical_rows(probs: np.ndarray, rng) -> np.ndarray:
@@ -771,39 +816,52 @@ def _sample_alpha(x, z, theta, params, rng):
 def infer_all(
     df: pd.DataFrame,
     params: ModelParams,
-    C_hat_dict: dict[int, int],
     *,
     S_burn: int = 200,
     S: int = 500,
     seed: int = 0,
     verbose: bool = True,
+    initial_c_dict: dict[int, int] | None = None,
+    initial_z_dict: dict[int, np.ndarray] | None = None,
+    c_logistic_model=None,
 ) -> dict[int, HomeInference]:
-    """Run infer_home over every home in df. C_hat_dict: {home_id: 0|1}."""
+    """Run mixture Gibbs on every home in df.  C is sampled in the chain.
+
+    initial_c_dict : {home_id: 0|1} warm-start C values (e.g. from heuristic).
+                     Defaults to C=1 for all homes if None.
+    initial_z_dict : {home_id: (D,T) array} warm-start z values.
+                     Defaults to all-off if None.
+    """
     if verbose:
         print("=" * 60)
-        print("INFERENCE: Gibbs over all homes")
+        print("INFERENCE: mixture Gibbs over all homes")
         print("=" * 60)
 
     sorted_df = df.sort_values(["home_id", "day", "time_index"])
-    homes = list(sorted_df["home_id"].unique())
-    rng = np.random.default_rng(seed)
+    homes     = list(sorted_df["home_id"].unique())
+    rng       = np.random.default_rng(seed)
 
     results: dict[int, HomeInference] = {}
     t0 = time.time()
     for i, hid in enumerate(homes):
-        g = sorted_df[sorted_df["home_id"] == hid]
-        D = len(g) // T
-        x = g["total_load"].to_numpy().reshape(D, T).astype(np.float64)
+        g   = sorted_df[sorted_df["home_id"] == hid]
+        D   = len(g) // T
+        x   = g["total_load"].to_numpy().reshape(D, T).astype(np.float64)
 
-        C_hat = int(C_hat_dict.get(int(hid), 0))
+        init_c = int((initial_c_dict or {}).get(int(hid), 1))
+        init_z = (initial_z_dict or {}).get(int(hid), None)
+
         if verbose:
-            print(f"\n[{i+1}/{len(homes)}] home {hid} (D={D}, "
-                  f"C_hat={C_hat}, ground_truth={int(g['has_ev'].iloc[0])})")
+            true_c = int(g["has_ev"].iloc[0]) if "has_ev" in g.columns else "?"
+            print(f"\n[{i+1}/{len(homes)}] home {hid}  "
+                  f"D={D}  true_c={true_c}  init_c={init_c}")
 
         results[int(hid)] = infer_home(
-            x, params, C_hat,
+            x, params,
             S_burn=S_burn, S=S,
             rng=rng, home_id=int(hid), verbose=verbose,
+            initial_c=init_c, initial_z=init_z,
+            c_logistic_model=c_logistic_model,
         )
 
     if verbose:
@@ -855,63 +913,230 @@ def build_heuristic_homes(df: pd.DataFrame) -> dict:
 def evaluate(
     df: pd.DataFrame,
     inferences: dict[int, HomeInference],
+    c_prob_methods: dict[str, dict[int, float]] | None = None,
     heuristic_states: dict[int, np.ndarray] | None = None,
 ) -> dict:
-    """Confusion matrices for C and z, with optional heuristic baseline for z."""
+    """Build z and C confusion matrices for all inference methods.
+
+    z confusion semantics:
+      - Computed per home (normalise each row by that home's true-state count),
+        then averaged over homes with equal weight.  NaN for rows with no
+        ground-truth examples in that home (e.g. rows 1/2 for non-EV homes).
+      - Reported separately for EV homes (C_true=1) and non-EV homes (C_true=0).
+      - Both hard (z_hat = argmax marginals) and soft (posterior marginals) versions.
+      - If heuristic_states provided: same hard confusion for the heuristic baseline.
+
+    C confusion semantics:
+      - For each method in c_prob_methods, one 2×2 hard and one 2×2 soft confusion.
+      - Hard: threshold P̂(C=1) at 0.5.  Soft: use P̂ as fractional prediction.
+      - Both are row-normalised (i.e. recall-style: fraction of each true class
+        going to each predicted class), averaged with equal weight over homes.
+
+    Parameters
+    ----------
+    c_prob_methods : {method_name: {home_id: P(C=1)}}.
+                     For homes where Gibbs was not run (C_hat=0), callers should
+                     pre-populate the dict with the heuristic p_hat as fallback.
+    heuristic_states : {home_id: flat 1-D array of per-timestep states (0/1/2)}.
+    """
     sorted_df = df.sort_values(["home_id", "day", "time_index"])
 
-    # C confusion: 2x2
-    C_hat = []
-    C_true = []
-    for hid, g in sorted_df.groupby("home_id", sort=False):
-        if int(hid) not in inferences:
-            continue
-        C_hat.append(inferences[int(hid)].C_hat)
-        C_true.append(int(g["has_ev"].iloc[0]))
-    C_hat = np.array(C_hat)
-    C_true = np.array(C_true)
-    C_cm = _confusion(C_true, C_hat, n_classes=2)
+    # per-home z confusion lists, split by C_true
+    ev_hard_cms, ev_soft_cms, ev_heur_cms     = [], [], []
+    non_ev_hard_cms, non_ev_soft_cms, non_ev_heur_cms = [], [], []
+    ev_home_ids, non_ev_home_ids              = [], []
 
-    # z confusion: 3x3 (EV homes only)
-    z_hat_all = []
-    z_true_all = []
-    z_heur_all = []
-    z_true_heur_all = []
-    for hid, g in sorted_df.groupby("home_id", sort=False):
-        if int(g["has_ev"].iloc[0]) != 1:
+    for hid, g in sorted_df.groupby("home_id", sort=True):
+        hid = int(hid)
+        if hid not in inferences:
             continue
-        if int(hid) not in inferences:
-            continue
-        D = len(g) // T
+        C_true = int(g["has_ev"].iloc[0])
+        D = g["day"].nunique()
         z_true = g["charge_state"].to_numpy().reshape(D, T)
-        inf = inferences[int(hid)]
-        z_hat_all.append(inf.z_hat.ravel())
-        z_true_all.append(z_true.ravel())
-        if heuristic_states is not None and int(hid) in heuristic_states:
-            heur = heuristic_states[int(hid)]
-            # heuristic gives a flat array; align to ground truth length
-            min_len = min(len(heur), z_true.size)
-            z_heur_all.append(heur[:min_len])
-            z_true_heur_all.append(z_true.ravel()[:min_len])
+        inf    = inferences[hid]
 
-    z_hat_arr = np.concatenate(z_hat_all) if z_hat_all else np.array([], dtype=int)
-    z_true_arr = np.concatenate(z_true_all) if z_true_all else np.array([], dtype=int)
-    z_cm = _confusion(z_true_arr, z_hat_arr, n_classes=K)
+        hard_cm = _per_home_z_confusion_hard(z_true, inf.z_hat)
+        soft_cm = (
+            _per_home_z_confusion_soft(z_true, inf.z_marginals)
+            if inf.z_marginals is not None else None
+        )
+        heur_cm = None
+        if heuristic_states and hid in heuristic_states:
+            heur_z = heuristic_states[hid][: D * T].reshape(D, T)
+            heur_cm = _per_home_z_confusion_hard(z_true, heur_z)
 
-    out = {
-        "C_confusion": C_cm,
-        "C_accuracy": float((C_hat == C_true).mean()) if len(C_true) else float("nan"),
-        "z_confusion": z_cm,
-        "z_accuracy": float((z_hat_arr == z_true_arr).mean()) if len(z_true_arr) else float("nan"),
+        if C_true == 1:
+            ev_home_ids.append(hid)
+            ev_hard_cms.append(hard_cm)
+            if soft_cm is not None:
+                ev_soft_cms.append(soft_cm)
+            if heur_cm is not None:
+                ev_heur_cms.append(heur_cm)
+        else:
+            non_ev_home_ids.append(hid)
+            non_ev_hard_cms.append(hard_cm)
+            if soft_cm is not None:
+                non_ev_soft_cms.append(soft_cm)
+            if heur_cm is not None:
+                non_ev_heur_cms.append(heur_cm)
+
+    # C confusion for each method
+    c_results: dict[str, dict] = {}
+    for method_name, c_probs in (c_prob_methods or {}).items():
+        c_results[method_name] = _c_confusion_from_probs(sorted_df, inferences, c_probs)
+
+    return {
+        # z — EV homes (C_true = 1)
+        "ev_home_ids":   ev_home_ids,
+        "ev_z_hard":     _nanmean_cms(ev_hard_cms),
+        "ev_z_soft":     _nanmean_cms(ev_soft_cms) if ev_soft_cms else None,
+        "ev_z_heur":     _nanmean_cms(ev_heur_cms) if ev_heur_cms else None,
+        # z — non-EV homes (C_true = 0); rows 1/2 will be NaN
+        "non_ev_home_ids": non_ev_home_ids,
+        "non_ev_z_hard": _nanmean_cms(non_ev_hard_cms),
+        "non_ev_z_soft": _nanmean_cms(non_ev_soft_cms) if non_ev_soft_cms else None,
+        "non_ev_z_heur": _nanmean_cms(non_ev_heur_cms) if non_ev_heur_cms else None,
+        # C — one dict per method
+        "c_results":     c_results,
     }
 
-    if z_heur_all:
-        z_heur_arr = np.concatenate(z_heur_all)
-        z_true_h = np.concatenate(z_true_heur_all)
-        out["z_confusion_baseline"] = _confusion(z_true_h, z_heur_arr, n_classes=K)
-        out["z_accuracy_baseline"] = float((z_heur_arr == z_true_h).mean())
 
-    return out
+# ---------------------------------------------------------------------------
+# Evaluation helpers
+# ---------------------------------------------------------------------------
+
+def _per_home_z_confusion_hard(
+    z_true: np.ndarray, z_pred: np.ndarray
+) -> np.ndarray:
+    """Row-normalised hard z confusion for one home. NaN for unobserved true states."""
+    cm = np.full((K, K), np.nan)
+    for k_true in range(K):
+        mask = (z_true == k_true)
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        for k_pred in range(K):
+            cm[k_true, k_pred] = float((z_pred[mask] == k_pred).sum()) / n
+    return cm
+
+
+def _per_home_z_confusion_soft(
+    z_true: np.ndarray, z_marginals: np.ndarray
+) -> np.ndarray:
+    """Row-normalised soft (expected) z confusion for one home."""
+    cm = np.full((K, K), np.nan)
+    for k_true in range(K):
+        mask = (z_true == k_true)
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        cm[k_true] = z_marginals[mask].sum(axis=0) / n
+    return cm
+
+
+def _nanmean_cms(cm_list: list[np.ndarray]) -> np.ndarray | None:
+    """Average a list of (K,K) confusion matrices, ignoring NaN entries."""
+    if not cm_list:
+        return None
+    return np.nanmean(np.stack(cm_list, axis=0), axis=0)
+
+
+def _c_confusion_from_probs(
+    sorted_df: pd.DataFrame,
+    inferences: dict[int, HomeInference],
+    c_probs: dict[int, float],
+) -> dict:
+    """Hard and soft 2×2 C confusion, row-normalised and averaged over homes."""
+    rows = []   # (C_true, C_hard, p_hat)
+    for hid, g in sorted_df.groupby("home_id", sort=True):
+        hid = int(hid)
+        if hid not in inferences or hid not in c_probs:
+            continue
+        C_true = int(g["has_ev"].iloc[0])
+        p_hat  = float(c_probs[hid])
+        rows.append((C_true, int(p_hat >= 0.5), p_hat))
+
+    # Build normalised 2×2 hard and soft CMs (equal weight per home)
+    hard_cm  = np.zeros((2, 2), dtype=float)
+    soft_cm  = np.zeros((2, 2), dtype=float)
+    counts   = np.zeros(2, dtype=int)
+    for C_true, C_hard, p_hat in rows:
+        hard_cm[C_true, C_hard] += 1
+        soft_cm[C_true, 0]      += 1 - p_hat
+        soft_cm[C_true, 1]      += p_hat
+        counts[C_true]           += 1
+
+    with np.errstate(invalid="ignore"):
+        hard_cm_norm = np.where(counts[:, None] > 0, hard_cm / counts[:, None], np.nan)
+        soft_cm_norm = np.where(counts[:, None] > 0, soft_cm / counts[:, None], np.nan)
+
+    n_correct = sum(1 for C_true, C_hard, _ in rows if C_true == C_hard)
+    return {
+        "hard_cm":  hard_cm_norm,
+        "soft_cm":  soft_cm_norm,
+        "accuracy": float(n_correct / max(len(rows), 1)),
+        "n_homes":  len(rows),
+        "n_ev":     int(counts[1]),
+        "n_non_ev": int(counts[0]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Printing
+# ---------------------------------------------------------------------------
+
+def print_evaluation(results: dict) -> None:
+    """Print evaluation results with clear labels for what is aggregated."""
+    SEP = "─" * 64
+
+    def _fmt_row(label: str, row: np.ndarray, n: int | None = None) -> str:
+        cells = "  ".join(
+            f"{'NaN':>7}" if np.isnan(v) else f"{v:>7.3f}" for v in row
+        )
+        suffix = f"  (n={n})" if n is not None else ""
+        return f"  {label:<8} {cells}{suffix}"
+
+    # ── z confusion ──────────────────────────────────────────────────────────
+    for group_label, home_ids, hard_cm, soft_cm, heur_cm in [
+        ("EV homes (C_true=1)",
+         results["ev_home_ids"],
+         results["ev_z_hard"], results["ev_z_soft"], results["ev_z_heur"]),
+        ("non-EV homes (C_true=0)",
+         results["non_ev_home_ids"],
+         results["non_ev_z_hard"], results["non_ev_z_soft"], results["non_ev_z_heur"]),
+    ]:
+        n_homes = len(home_ids)
+        print(f"\n{SEP}")
+        print(f"z confusion — {group_label}  (N={n_homes} homes)")
+        print(f"  Aggregation: per-home row-normalised CM, then mean over {n_homes} homes")
+        print(f"  Rows = true state, columns = predicted state")
+        if group_label.startswith("non-EV"):
+            print("  Note: rows 'low' and 'high' are NaN (no ground-truth examples)")
+        header = f"  {'':8}  {'off':>7}  {'low':>7}  {'high':>7}"
+
+        for cm, variant in [(hard_cm, "hard (MAP z)"), (soft_cm, "soft (posterior)"),
+                            (heur_cm, "hard (heuristic baseline)")]:
+            if cm is None:
+                continue
+            print(f"\n  [{variant}]")
+            print(header)
+            for k, name in enumerate(STATE_NAMES):
+                print(_fmt_row(name, cm[k]))
+
+    # ── C confusion ──────────────────────────────────────────────────────────
+    for method_name, cr in results.get("c_results", {}).items():
+        print(f"\n{SEP}")
+        print(f"C confusion — method: {method_name}")
+        print(f"  Aggregation: row-normalised CM averaged over {cr['n_homes']} homes")
+        print(f"  ({cr['n_ev']} EV, {cr['n_non_ev']} non-EV)  accuracy={cr['accuracy']:.4f}")
+        print(f"  Rows = true C, columns = predicted C")
+        header = f"  {'':8}  {'no-EV':>7}  {'EV':>7}"
+        for cm, variant in [(cr["hard_cm"], "hard (threshold 0.5)"),
+                            (cr["soft_cm"], "soft (P̂ as fraction)")]:
+            print(f"\n  [{variant}]")
+            print(header)
+            for k, name in enumerate(["no-EV", "EV"]):
+                print(_fmt_row(name, cm[k]))
 
 
 def _confusion(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) -> np.ndarray:
