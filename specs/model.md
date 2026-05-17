@@ -264,19 +264,27 @@ $$\hat\eta^{(n)}_t = \tfrac{1}{D^{(n)}}\sum_{d=1}^{D^{(n)}} x^{\text{Non-EV},(n)
 At $D^{(n)} \approx 365$, this is sharp — within-home noise in $\hat\eta^{(n)}_t$
 is $(\omega^{(n)}_t)^2/D^{(n)}$, an order or two below cross-home variation.
 
-**Inference.** Gibbs block 4 (see §4). Conditional on the augmented latent
-$\{x^{\text{Non-EV},(n)}_{d,t}\}$ (§2.5) and current $\omega^{(n)}$, the
-likelihood factorizes per $t$ into i.i.d. Gaussian observations of $\eta^{(n)}_t$
-with variance $(\omega^{(n)}_t)^2$. Combined with the $T$-dim Gaussian prior,
-the conditional posterior is
+**Inference.** Gibbs block 3 (see §4). Operates directly on the observed total
+$x^{(n)}_{d,t}$ using the marginal combined-variance likelihood
+$x^{(n)}_{d,t} - \Theta^{(n)}_{z_{d,t}} \sim \mathcal{N}\!\left(\eta^{(n)}_t,\ \sigma^2_{z_{d,t},t}\right)$
+where $\sigma^2_{k,t} = (\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2$. Conditional
+on current $z, \Theta, \omega^{(n)}$, the likelihood factorizes per $t$ into
+i.i.d. Gaussian observations of $\eta^{(n)}_t$ with **heteroscedastic
+variances** (different $d$ at the same $t$ have different variances because
+$z_{d,t}$ varies); combined with the PPCA prior, the posterior is
 
 $$\eta^{(n)} \sim \mathcal{N}\!\left(\Lambda^{-1}\,h,\ \Lambda^{-1}\right),$$
 
-$$\Lambda = \Sigma_\eta^{-1} + \mathrm{diag}\!\left(\tfrac{D^{(n)}}{(\omega^{(n)}_t)^2}\right),\quad h = \Sigma_\eta^{-1}\bar\eta + \tfrac{1}{(\omega^{(n)}_t)^2}\sum_d x^{\text{Non-EV},(n)}_{d,t}.$$
+$$\Lambda = \Sigma_\eta^{-1} + \mathrm{diag}(\lambda_t),\quad \lambda_t = \sum_d \tfrac{1}{\sigma^2_{z_{d,t}, t}},\quad h_t^{(\text{data})} = \sum_d \tfrac{x^{(n)}_{d,t} - \Theta^{(n)}_{z_{d,t}}}{\sigma^2_{z_{d,t}, t}},\quad h = \Sigma_\eta^{-1}\bar\eta + h^{(\text{data})}.$$
 
 $\Sigma_\eta^{-1}$ is computed once per iter via the Woodbury identity
 ($O(T r^2)$); the $T \times T$ Cholesky of $\Lambda$ is $\sim 10^5$ flops at
 $T{=}96$ — negligible.
+
+This is the **marginal-likelihood update**: we never sample the latent
+component $x^{\text{Non-EV}}_{d,t}$. The additive decomposition
+$x = x^{\text{EV}} + x^{\text{Non-EV}}$ stays implicit, as in the rank-1
+model — see §2.5 for why we resisted data augmentation here.
 
 **Why hierarchical (and *why low-rank+diagonal*)?**
 
@@ -367,12 +375,20 @@ This is the conjugate prior for an unknown variance under Gaussian observations.
 
 $$\widehat{(\omega^{(n)}_t)^2} = \tfrac{1}{D^{(n)}}\sum_{d=1}^{D^{(n)}} \left(x^{\text{Non-EV},(n)}_{d,t} - \hat\eta^{(n)}_t\right)^2.$$
 
-**Inference.** Gibbs block 5 (see §4). Conditional on the augmented latent
-$\{x^{\text{Non-EV},(n)}_{d,t}\}$ (§2.5) and current $\eta^{(n)}$,
+**Inference.** Gibbs block 4 (see §4). The posterior under the marginal
+combined-variance likelihood is **not conjugate** — the unknown $(\omega^{(n)}_t)^2$
+enters the likelihood through the sum $\sigma^{\text{EV}}_{z_{d,t}}^2 + (\omega^{(n)}_t)^2$,
+not as the full variance. The log-posterior is, scalar per $t$ and
+independent across $t$:
 
-$$(\omega^{(n)}_t)^2 \sim \mathrm{InvGamma}\!\left(a^\omega_t + \tfrac{D^{(n)}}{2},\ b^\omega_t + \tfrac{1}{2}\sum_d (x^{\text{Non-EV},(n)}_{d,t} - \eta^{(n)}_t)^2\right),$$
+$$\log p\!\left((\omega^{(n)}_t)^2 \,\big|\, z, \Theta, \eta, x\right) \;=\; \log p_{\mathrm{IG}}\!\left((\omega^{(n)}_t)^2; a^\omega_t, b^\omega_t\right) \;-\; \tfrac{1}{2}\sum_d \!\left[\log\sigma^2_{z_{d,t}, t} + \tfrac{(x_{d,t} - \Theta_{z_{d,t}} - \eta^{(n)}_t)^2}{\sigma^2_{z_{d,t}, t}}\right]$$
 
-independently per $t$.
+with $\sigma^2_{k,t} = (\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2$. We sample
+each $(\omega^{(n)}_t)^2$ with a **univariate slice sampler** (Neal 2003)
+with stepping-out and shrinkage, working in log-space
+($\ell = \log(\omega^{(n)}_t)^2$) for scale invariance. Slice sampling is
+tuning-free, robust on unimodal targets, and well-suited to scalar
+posteriors of this form.
 
 **Why per-home, per-$t$?** The rank-1 model used a *globally pooled*
 $\sigma^{\text{Non-EV}}_t$ — every home shares the same noise profile. This is
@@ -380,24 +396,33 @@ clearly wrong: homes differ in HVAC cycling, appliance usage, baseline
 variability. We let homes have their own scale; the hierarchical IG prior
 shares strength across homes.
 
-**Why diagonal across $t$ (independent IG per $t$)?** This is the
-*HMM-compatibility constraint*: emission variance enters the FFBS forward
-pass diagonally. A non-diagonal prior on $\omega$ across $t$ would *not*
-break the HMM (we Gibbs-sample $\omega$ in its own block, so the HMM never
-sees a non-diagonal $\omega$ distribution) — but it would break conjugacy.
-Independent IG per $t$ gives closed-form sampling; coupling across $t$ (e.g.,
-log-Normal hierarchy on $\log\omega$) would require Metropolis or HMC. Not
-worth the complexity for diminishing returns.
+**Why diagonal across $t$ (independent prior per $t$)?** Emission variance
+enters the FFBS forward pass diagonally; the per-$t$ independence isn't
+required for the slice sampler itself (each $t$ would still be a scalar
+update) but it keeps the prior fit (§2.4) two-parameters-per-$t$ and avoids
+specifying a $T$-dim joint distribution over variances.
+
+**Why slice sampling, not conjugate IG with data augmentation?** Augmenting
+the latent $x^{\text{EV}}, x^{\text{Non-EV}}$ decomposition would restore
+conjugacy (the $\omega$ update becomes $\mathrm{IG}(a + D/2,\ b + \tfrac{1}{2}\sum_d (x^{\text{Non-EV}}_{d,t} - \eta_t)^2)$
+exactly) — at the cost of (a) throwing away the *marginal-likelihood* property
+that made the rank-1 model elegant, (b) introducing autocorrelation between
+augmented latents and $\omega$ samples that empirically slows mixing for
+variance components, and (c) carrying two $(D,T)$ latent arrays in
+`HomeInference`. Slice sampling preserves marginalization and adds only
+~30 lines of code. See §2.5.
 
 **Alternatives considered.**
+- **Conjugate IG with data augmentation.** See §2.5.
+- **Plug-in MAP (Stochastic-EM)** of $(\omega^{(n)}_t)^2$ via 1-D Newton
+  per iter. Faster than slice sampling but discards Bayesian uncertainty
+  over $\omega$.
 - **Log-Normal hierarchy.** More "natural" prior on a positive scale; loses
-  conjugacy. Rejected on simplicity grounds.
-- **Pooled $\omega_t$ (rank-1's choice).** Simpler but empirically restrictive.
+  conjugacy *and* doesn't help with the sum-variance non-conjugacy. Rejected.
 - **Half-Cauchy on $\omega^{(n)}_t$** with a higher-level scale. Common in
-  Bayesian hierarchical literature; loses conjugacy. Same trade-off as
-  log-Normal.
+  Bayesian hierarchical literature; same non-conjugacy story.
 
-**Code (planned).** New `_sample_omega()` in
+**Code (planned).** New `_sample_omega()` (slice sampler in log-space) in
 [`graphical_model.py`](../models/graphical_model.py).
 
 ### 2.4 $a^\omega_t, b^\omega_t$ — hyperparameters of the $\omega$ prior
@@ -420,54 +445,40 @@ MoM is good enough at this $N$.
 **Code (planned).** New `_fit_omega_prior()` in
 [`graphical_model.py`](../models/graphical_model.py).
 
-### 2.5 $x^{\text{EV},(n)}_{d,t}, x^{\text{Non-EV},(n)}_{d,t}$ — latent decomposition (data augmentation)
+### 2.5 Why we keep $x^{\text{EV}}, x^{\text{Non-EV}}$ marginalized at inference
 
-**Why this is new at inference.** In the deprecated model, the Non-EV noise
-$\sigma^{\text{Non-EV}}_t$ is a *fixed* global parameter at inference time, so
-the combined emission variance $\sigma^2_{k,t}$ is constant across Gibbs
-iterations and the $\Theta, \alpha$ conditionals are conjugate without
-needing to decompose $x = x^{\text{EV}} + x^{\text{Non-EV}}$. In the new model,
-$\omega^{(n)}_t$ is *sampled* at inference time — and Inverse-Gamma is **not**
-conjugate to a Gaussian likelihood whose variance is $(\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2$
-(a *sum* involving the unknown). To restore conjugacy, we sample the latent
-decomposition.
+**The temptation: data augmentation.** Inverse-Gamma is conjugate to
+$\mathcal{N}(\mu, \omega^2)$ but **not** to $\mathcal{N}(\mu, c + \omega^2)$
+where $c = (\sigma^{\text{EV}}_k)^2$ is a known offset. A textbook workaround is
+to sample the latent decomposition $x^{(n)}_{d,t} = x^{\text{EV},(n)}_{d,t} + x^{\text{Non-EV},(n)}_{d,t}$
+as auxiliary variables — the Gaussian-sum conditional is closed form — and
+then use the augmented $\{x^{\text{Non-EV}}_{d,t}\}$ to drive a fully
+conjugate IG update on $(\omega^{(n)}_t)^2$.
 
-**Distribution (closed-form Gaussian).** Conditional on $z^{(n)}_{d,t}=k$,
-$\Theta^{(n)}, \eta^{(n)}, \omega^{(n)}$, and the observed total
-$x^{(n)}_{d,t}$:
+**Why we don't do this.** The rank-1 model never decomposed $x$; every Gibbs
+block (FFBS, $\Theta$, $\alpha$) operated on the *marginal* combined-variance
+likelihood. This is structurally elegant *and* avoids a well-known mixing
+pathology of data augmentation for variance components: the augmented
+latents $x^{\text{Non-EV}}_{d,t}$ and the variance $\omega^{(n)}_t$ are
+strongly correlated under the joint posterior, so each Gibbs step moves them
+in lock-step, slowing chain mixing. The cost in raw flops/memory is small
+($DT$ Gaussian draws + two $(D,T)$ arrays), but the mixing cost is the kind
+that hides in 500-iter chains and only shows up when you check trace plots.
 
-$$x^{\text{EV},(n)}_{d,t} \mid \cdot \;\sim\; \mathcal{N}\!\left(\mu^{\text{EV}}_{d,t},\ V_{d,t}\right),\quad x^{\text{Non-EV},(n)}_{d,t} = x^{(n)}_{d,t} - x^{\text{EV},(n)}_{d,t},$$
+**What we do instead.** Slice-sample $(\omega^{(n)}_t)^2$ directly under the
+marginal log-posterior (see §2.3 inference). The other blocks ($\Theta_k$,
+$\eta$) stay as marginal-likelihood conjugate Gaussian updates with
+heteroscedastic-in-$z$ variances — same skeleton as the rank-1 model.
 
-with
+**Cost of slice sampling.** $T$ scalar slice samples per home per iter; each
+needs ~5–10 log-density evaluations, each $O(D)$. Total $O(\text{const}\cdot TD)$ per
+iter — same big-O as augmentation, modestly larger constant. No latent
+$x^{\text{EV}}, x^{\text{Non-EV}}$ arrays in `HomeInference`.
 
-$$\mu^{\text{EV}}_{d,t} = \Theta^{(n)}_k + \tfrac{(\sigma^{\text{EV}}_k)^2}{(\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2}\!\left(x^{(n)}_{d,t} - \Theta^{(n)}_k - \eta^{(n)}_t\right),\quad V_{d,t} = \tfrac{(\sigma^{\text{EV}}_k)^2(\omega^{(n)}_t)^2}{(\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2}.$$
-
-i.i.d. across $(d,t)$. Standard Gaussian-sum decomposition (Kalman-style).
-
-**Cost.** $D\cdot T$ Gaussian draws per home per Gibbs iter ($\approx 35{,}000$
-draws — vectorizable, $\ll$ FFBS cost).
-
-**Memory.** Two $(D, T)$ arrays per home (~0.5 MB total). Negligible.
-
-**Side benefit.** Once the latent decomposition is sampled, the other blocks
-*simplify*: $\Theta^{(n)}_k$ updates use $\{x^{\text{EV}}_{d,t}\}$ directly
-with variance $(\sigma^{\text{EV}}_k)^2$ alone (no per-$t$ combined variance);
-$\eta^{(n)}$ updates use $\{x^{\text{Non-EV}}_{d,t}\}$ directly with variance
-$(\omega^{(n)}_t)^2$ alone. Every block becomes a clean conjugate update.
-
-**Trade-off.** Data augmentation introduces autocorrelation between successive
-Gibbs samples (the augmented latents and the variance share information).
-Mixing can be slower than a collapsed sampler. Standard, well-understood;
-mitigations include longer burn-in or thinned chains if it becomes an issue
-empirically.
-
-**Alternative considered: non-conjugate $\omega$ sampling.** Skip the
-augmentation block; sample $\omega^{(n)}_t$ via slice sampler or
-Metropolis-Hastings on the combined-emission likelihood. Avoids the extra
-$DT$ draws but introduces tuning (step size) and is harder to vectorize
-cleanly. Rejected for simplicity.
-
-**Code (planned).** New `_sample_latent_decomp()` block in the Gibbs loop.
+**Falling back to augmentation.** If slice mixing turns out to be poor in
+practice (e.g., heavy-tailed posteriors at small $D^{(n)}$), the augmentation
+path is documented above and ~50 lines of additional code; we can swap in
+without changing other blocks.
 
 ### 2.6 Evaluation plan for the migration
 
@@ -587,8 +598,10 @@ $(\omega^{(n)}_t)^2 \to (\sigma^{\text{Non-EV}}_t)^2$.)
 $x^{\text{Non-EV}}$ are also separately observed (training is on labeled data).
 
 **Inference.** The *only* observed variable. Drives the FFBS emission
-likelihoods in block 1, the latent decomposition in block 2 (new model only),
-and the data terms in the remaining blocks.
+likelihoods in block 1 and the data terms in blocks 2–4. Crucially, the
+latent decomposition $x = x^{\text{EV}} + x^{\text{Non-EV}}$ is **not
+sampled** — it stays marginalized throughout, exactly as in the rank-1
+model (see §2.5).
 
 **Code.** Total-power arrays are assembled per home by
 [`_build_home_arrays()`](../models/graphical_model.py#L230); used throughout
@@ -601,44 +614,45 @@ and the data terms in the remaining blocks.
 Per-home Gibbs sampler ([`infer_home()`](../models/graphical_model.py#L490)),
 applied only to homes with $\hat C^{(n)}=1$.
 
-### 4.1 New model — five-block Gibbs
+### 4.1 New model — four-block Gibbs
 
-Each iteration executes the following blocks in order. **Not yet implemented.**
+Each iteration executes the following blocks in order. Same skeleton as the
+deprecated three-block Gibbs (§4.2), with $\alpha$ replaced by a $T$-dim
+$\eta$ block and a new $\omega$ block; latent components $x^{\text{EV}}, x^{\text{Non-EV}}$
+remain *marginalized throughout* (see §2.5). **Not yet implemented.**
 
-1. **FFBS for $z^{(n)}_{d,t}$** (§1.3). Uses combined-emission likelihood
+1. **FFBS for $z^{(n)}_{d,t}$** (§1.3). Combined-emission likelihood
    $\mathcal{N}(\Theta^{(n)}_k + \eta^{(n)}_t,\ (\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2)$.
-   Factorizes across $t$ given the current parameters — diagonal emission
-   variance is required and preserved.
-2. **Latent decomposition** (§2.5). Sample $x^{\text{EV},(n)}_{d,t}$ from the
-   Gaussian-sum conditional given observed $x^{(n)}_{d,t}$, $z^{(n)}_{d,t}$,
-   $\Theta^{(n)}, \eta^{(n)}, \omega^{(n)}$. Set
-   $x^{\text{Non-EV},(n)}_{d,t} = x^{(n)}_{d,t} - x^{\text{EV},(n)}_{d,t}$.
-3. **$\Theta^{(n)}_k$** (§1.5, simplified). Conjugate Gaussian using
-   $\{x^{\text{EV},(n)}_{d,t} : z^{(n)}_{d,t}{=}k\}$ with variance
-   $(\sigma^{\text{EV}}_k)^2$ alone (no per-$t$ combined variance term).
-4. **$\eta^{(n)}$** (§2.1). $T$-dim Gaussian conjugate update from
-   $\{x^{\text{Non-EV},(n)}_{d,t}\}$ with PPCA prior $\mathcal{N}(\bar\eta, \Sigma_\eta)$
-   and per-$t$ likelihood variance $(\omega^{(n)}_t)^2$. $T\times T$ Cholesky;
-   Woodbury for $\Sigma_\eta^{-1}$.
-5. **$\omega^{(n)}_t$** (§2.3). Per-$t$ Inverse-Gamma conjugate update from
-   residuals $\{x^{\text{Non-EV},(n)}_{d,t} - \eta^{(n)}_t\}_d$.
+   Factorizes across $t$ given current parameters.
+2. **$\Theta^{(n)}_k$** for $k\in\{\texttt{low},\texttt{high}\}$ (§1.5).
+   Conjugate Gaussian on residuals $x^{(n)}_{d,t} - \eta^{(n)}_t$ over
+   $(d,t)\in\mathcal{T}_k$, with heteroscedastic variance
+   $\sigma^{\text{EV}}_k{}^2 + \omega^{(n)}_t{}^2$.
+3. **$\eta^{(n)}$** (§2.1). $T$-dim Gaussian conjugate update on residuals
+   $x^{(n)}_{d,t} - \Theta^{(n)}_{z_{d,t}}$ with per-cell heteroscedastic
+   variance $\sigma^2_{z_{d,t}, t}$ and PPCA prior
+   $\mathcal{N}(\bar\eta, \Sigma_\eta)$. $T\times T$ Cholesky; Woodbury for
+   $\Sigma_\eta^{-1}$.
+4. **$\omega^{(n)}_t$** (§2.3). Univariate **slice sample** in log-space per
+   $t$, on the marginal log-posterior with IG prior. Non-conjugate; tuning-free.
 
-**Initialization.** $\eta^{(n)} = \bar\eta$, $\omega^{(n)}_t = $ prior mode
-$\sqrt{b^\omega_t / (a^\omega_t + 1)}$, $\Theta^{(n)}_k = \mu_{\Theta_k}$,
-$z\equiv\texttt{off}$.
+**Initialization.** $\eta^{(n)} = \bar\eta$,
+$(\omega^{(n)}_t)^2 = b^\omega_t / (a^\omega_t + 1)$ (prior mode),
+$\Theta^{(n)}_k = \mu_{\Theta_k}$, $z\equiv\texttt{off}$.
 
-**Schedule.** Keep $S_{\text{burn}}=200$ burn-in + $S=500$ retained iters.
-Re-tune empirically after Tier-1 evaluation; data augmentation may require
-longer burn-in.
+**Schedule.** Keep $S_{\text{burn}}=200$ burn-in + $S=500$ retained iters,
+same as rank-1.
 
-**Accumulation.** $z$-counts accumulated incrementally post-burn (unchanged).
-Per-iter $\eta^{(n)}, \omega^{(n)}, \Theta^{(n)}$ samples retained
-(cheap; $S \times T$ and $S\times K$ floats per home).
+**Accumulation.** $z$-counts incrementally post-burn (unchanged). Per-iter
+$\eta^{(n)} \in \mathbb{R}^T$, $\omega^{(n)} \in \mathbb{R}^T$, and
+$\Theta^{(n)} \in \mathbb{R}^K$ samples retained (cheap; $S\cdot T$ and
+$S\cdot K$ floats per home).
 
-**Computational budget.** FFBS still dominates ($O(K^2 T D)$); blocks 2 and 5
-are $O(DT)$; block 4 is $O(T^3 + Tr^2) \approx 10^6$ flops per iter. Per-home
-per-iter cost increases by $\sim 2\times$ vs. the deprecated model; total
-runtime still well under 10 minutes for 9 EV homes.
+**Computational budget.** FFBS still dominates ($O(K^2 T D)$); block 2 is
+$O(\sum_k|\mathcal{T}_k|) = O(DT)$; block 3 is $O(DT + T^3 + Tr^2)$ with
+$T^3 \approx 10^6$ at $T{=}96$; block 4 is $O(\text{slice-evals}\cdot TD)$ with
+typically 5–10 evals per slice. Per-home per-iter cost $\sim 1.5\times$ the
+deprecated model; total runtime stays under a few minutes for 9 EV homes.
 
 ### 4.2 Deprecated model — three-block Gibbs
 
@@ -699,7 +713,7 @@ which the Gibbs sampler is compared.
 | $p_C$ | global scalar | empirical mean | unused | [`fit()`](../models/graphical_model.py#L129) |
 | $z^{(n)}_{d,t}$ | per-home latent | observed | FFBS (block 1) | [`_ffbs()`](../models/graphical_model.py#L702) |
 | $\pi_z, P_z$ | global | smoothed counts | read-only | [`_fit_hmm()`](../models/graphical_model.py#L257) |
-| $\Theta^{(n)}_k$ | per-home latent | observed | Gibbs (block 3, new; block 2, old) | [`_sample_theta_k()`](../models/graphical_model.py#L789) |
+| $\Theta^{(n)}_k$ | per-home latent | observed | Gibbs block 2 | [`_sample_theta_k()`](../models/graphical_model.py#L789) |
 | $\mu_{\Theta_k}, \sigma_{\Theta_k}, \sigma^{\text{EV}}_k$ | global | EM | read-only | [`_fit_charging_em()`](../models/graphical_model.py#L366) |
 | $x^{(n)}_{d,t}$ | observed | observed | observed | [`_build_home_arrays()`](../models/graphical_model.py#L230) |
 
@@ -707,11 +721,10 @@ which the Gibbs sampler is compared.
 
 | Symbol | Kind | Fit | Inference | Code (planned) |
 |---|---|---|---|---|
-| $\eta^{(n)}_t$ | per-home latent ($T$-vec) | empirical day-mean | Gibbs block 4 ($T$-dim Gaussian) | `_sample_eta()` |
-| $\bar\eta_t, W, \psi$ | global ($\Sigma_\eta = WW^\top + \mathrm{diag}(\psi)$) | mean + PPCA-EM with bias-correction | read-only | `_fit_eta_prior()` |
-| $\omega^{(n)}_t$ | per-home latent ($T$-vec) | empirical per-$t$ var | Gibbs block 5 (per-$t$ IG) | `_sample_omega()` |
+| $\eta^{(n)}_t$ | per-home latent ($T$-vec) | empirical day-mean | Gibbs block 3 ($T$-dim Gaussian, heteroscedastic) | `_sample_eta()` |
+| $\bar\eta_t, W, \psi$ | global ($\Sigma_\eta = WW^\top + \mathrm{diag}(\psi)$) | mean + PPCA with bias-correction | read-only | `_fit_eta_prior()` |
+| $\omega^{(n)}_t$ | per-home latent ($T$-vec) | empirical per-$t$ var | Gibbs block 4 (slice sample, per-$t$) | `_sample_omega()` |
 | $a^\omega_t, b^\omega_t$ | global ($T$-vec each) | method-of-moments | read-only | `_fit_omega_prior()` |
-| $x^{\text{EV}}, x^{\text{Non-EV}}$ | augmented latents | (latents at fit-time too, but observed) | Gibbs block 2 (Gaussian-sum decomp) | `_sample_latent_decomp()` |
 
 ### 6.3 Non-EV side — deprecated rank-1 (currently in code)
 
