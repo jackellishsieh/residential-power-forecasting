@@ -1,21 +1,58 @@
 """
-Background load visualization: empirical data vs model prediction.
+Background (Non-EV) visualization for the hierarchical model.
 
-Two public entry points:
-  plot_background_comparison  --  N+1 stacked time-series (one per home + prior)
-  plot_alpha_posteriors       --  forest plot of per-home alpha posteriors vs prior
+Matches specs/model.md §2.1–§2.5: per-home mean profile eta^(n) under PPCA
+prior, per-home std profile omega^(n) under InvGamma prior. All plotting
+helpers here are diagnostic / fit-time visualizations, not Gibbs inference.
 
-All plots sharing the time axis use hourly HH:MM labels.
-All per-home time-series share the same absolute kW y-axis.
+Public entry points:
+
+  plot_prior_predictive(params)
+      Standalone figure of the *generative* prior predictive for a new home:
+          center  = eta_bar
+          inner   = +/- sqrt(E[omega^2])
+          outer   = +/- sqrt(Var(eta) + E[omega^2])
+
+  plot_background_per_home(train_df, params, home_ids)
+      Stacked panels (one per home), each comparing:
+          empirical day-mean profile +/- empirical day-std band
+              (solid line, light fill)
+          posterior MAP of eta under fitted prior +/- posterior MAP of omega
+              (dashed line, hatched fill)
+      Use this to answer: "how finely does the prior allow us to fit this
+      home's shape?" — when the prior is tight (small r, small psi), the
+      dashed line shrinks toward eta_bar and the dashed band tightens.
+
+  plot_eta_per_home(train_df, params, home_ids)
+      Per-home empirical mean profile overlaid on the prior eta distribution
+      envelope (eta_bar +/- sqrt(Var(eta))). Answers: "is this home's mean
+      typical under the prior?"
+
+  plot_omega_per_home(train_df, params, home_ids)
+      Per-home empirical std profile overlaid on the prior omega distribution
+      envelope (16/84 IG percentiles). Answers: "is this home's noise
+      profile typical under the prior?"
+
+  plot_inference_vs_truth(test_df, inference, params, home_id)
+      Inference diagnostic: for one home, compare the inferred posterior over
+      (eta, omega) to the ground-truth x_Non-EV statistics. Three stacked
+      panels (mean, std, z-error rates). Use this to localize where Gibbs is
+      mis-attributing variance — typically, false-positive z timesteps line
+      up with timesteps where inferred eta sits below true x_Non-EV mean.
+
+All plots sharing a time axis use hourly HH:MM labels.
 """
 
 from __future__ import annotations
+
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from scipy import stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,400 +71,582 @@ def _apply_hourly_time_axis(ax: Axes) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Core computation
+# Computations: prior summaries
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _compute_alpha_posterior(
-    empirical_day_mean: np.ndarray,  # (T,) per-home mean of non_ev_load across days
-    num_days: int,
-    rho: np.ndarray,                 # (T,) from ModelParams
-    sigma2_nonev: np.ndarray,        # (T,) from ModelParams
-    mu_alpha: float,                 # prior mean
-    sigma2_alpha: float,             # prior variance
-) -> tuple[float, float]:
-    """Conjugate Gaussian posterior for one home's alpha.
+def _sigma_eta_diag(params) -> np.ndarray:
+    """Diagonal of Sigma_eta = W W^T + diag(psi). Shape (T,)."""
+    return (params.W_eta ** 2).sum(axis=1) + params.psi_eta
 
-    Model:
-      alpha          ~ N(mu_alpha, sigma2_alpha)               [prior]
-      beta_hat[t]    ~ N(alpha * rho[t], sigma2_nonev[t]/D)    [likelihood, day-mean obs]
 
-    Returns (posterior_mean, posterior_std).
-    With D~350 and T=96, data dominates: posterior_std << prior_std.
+def _omega2_prior_moments(params) -> tuple[np.ndarray, np.ndarray]:
+    """Mean and variance of (omega_t)^2 under InvGamma(a_omega_t, b_omega_t).
+
+    Returns (E[omega^2], Var[omega^2]). Both shape (T,). Var is NaN for a<=2.
     """
-    prior_precision = 1.0 / sigma2_alpha
-    # Each day-mean observation contributes D times the per-observation precision
-    data_precision = num_days * np.sum(rho ** 2 / sigma2_nonev)
-    posterior_precision = prior_precision + data_precision
+    a = params.a_omega
+    b = params.b_omega
+    mean = b / np.maximum(a - 1.0, 1e-12)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        var = np.where(
+            a > 2.0,
+            (b ** 2) / ((a - 1.0) ** 2 * (a - 2.0)),
+            np.nan,
+        )
+    return mean, var
 
-    prior_contribution = mu_alpha / sigma2_alpha
-    data_contribution = num_days * np.sum(rho * empirical_day_mean / sigma2_nonev)
-    posterior_mean = (prior_contribution + data_contribution) / posterior_precision
 
-    return float(posterior_mean), float(np.sqrt(1.0 / posterior_precision))
+def _omega_prior_quantiles(params, q_lo: float = 0.16, q_hi: float = 0.84) -> tuple[np.ndarray, np.ndarray]:
+    """Per-t quantiles of omega_t under the IG prior on omega^2.
 
-
-def compute_home_background_stats(home_df: pd.DataFrame, params) -> dict:
-    """Compute all empirical + model stats for one home's background load.
-
-    Returned dict keys:
-      home_id, has_ev, num_days,
-      empirical_traces     (D, T)  -- individual daily non-EV traces
-      empirical_mean       (T,)    -- mean across days
-      empirical_std        (T,)    -- std across days
-      posterior_alpha_mean float
-      posterior_alpha_std  float
-      model_mean           (T,)    -- posterior_alpha_mean * rho
-      alpha_only_band_lo/hi (T,)   -- CI from alpha uncertainty alone
-      combined_band_lo/hi  (T,)    -- CI from alpha uncertainty + nonev noise
+    Returns (omega_q_lo, omega_q_hi) — quantiles of omega (not omega^2),
+    obtained by sqrt of the corresponding omega^2 quantiles.
     """
-    home_id = int(home_df["home_id"].iloc[0])
-    has_ev = bool(home_df["has_ev"].iloc[0])
-    num_days = home_df["day"].nunique()
-
-    # Shape individual days into (D, T)
-    daily_traces = (
-        home_df.groupby(["day", "time_index"])["non_ev_load"]
-        .first()
-        .unstack("time_index")
-        .values
-        .astype(np.float64)
-    )
-    empirical_day_mean = daily_traces.mean(axis=0)          # (T,)
-    empirical_day_std  = daily_traces.std(axis=0, ddof=1)   # (T,)
-
-    posterior_alpha_mean, posterior_alpha_std = _compute_alpha_posterior(
-        empirical_day_mean = empirical_day_mean,
-        num_days           = num_days,
-        rho                = params.rho,
-        sigma2_nonev       = params.sigma2_nonev,
-        mu_alpha           = params.mu_alpha,
-        sigma2_alpha       = params.sigma2_alpha,
-    )
-
-    model_mean             = posterior_alpha_mean * params.rho                     # (T,)
-    alpha_uncertainty_std  = posterior_alpha_std  * params.rho                     # (T,); rho >= 0
-    combined_std           = np.sqrt(alpha_uncertainty_std ** 2 + params.sigma2_nonev)
-
-    return dict(
-        home_id              = home_id,
-        has_ev               = has_ev,
-        num_days             = num_days,
-        empirical_traces     = daily_traces,
-        empirical_mean       = empirical_day_mean,
-        empirical_std        = empirical_day_std,
-        posterior_alpha_mean = posterior_alpha_mean,
-        posterior_alpha_std  = posterior_alpha_std,
-        model_mean           = model_mean,
-        alpha_only_band_lo   = model_mean - alpha_uncertainty_std,
-        alpha_only_band_hi   = model_mean + alpha_uncertainty_std,
-        combined_band_lo     = model_mean - combined_std,
-        combined_band_hi     = model_mean + combined_std,
-    )
+    # scipy.stats.invgamma uses shape=a, scale=b (matches our parameterization)
+    omega2_lo = stats.invgamma.ppf(q_lo, a=params.a_omega, scale=params.b_omega)
+    omega2_hi = stats.invgamma.ppf(q_hi, a=params.a_omega, scale=params.b_omega)
+    return np.sqrt(omega2_lo), np.sqrt(omega2_hi)
 
 
-def compute_prior_background_stats(params) -> dict:
-    """Stats for the prior predictive distribution (no home-specific data)."""
-    prior_alpha_std       = np.sqrt(params.sigma2_alpha)
-    model_mean            = params.mu_alpha * params.rho
-    alpha_uncertainty_std = prior_alpha_std * params.rho
-    combined_std          = np.sqrt(alpha_uncertainty_std ** 2 + params.sigma2_nonev)
-    return dict(
-        model_mean         = model_mean,
-        alpha_only_band_lo = model_mean - alpha_uncertainty_std,
-        alpha_only_band_hi = model_mean + alpha_uncertainty_std,
-        combined_band_lo   = model_mean - combined_std,
-        combined_band_hi   = model_mean + combined_std,
-        # These fields mirror compute_home_background_stats for uniform drawing code
-        empirical_traces   = None,
-        empirical_mean     = None,
-        empirical_std      = None,
-    )
+def compute_prior_predictive(params) -> dict:
+    """Prior predictive summary for a single observation from a NEW home.
+
+    Returns a dict:
+        center      : eta_bar                                              (T,)
+        sigma_obs   : sqrt(E[omega^2])              (inner band half)      (T,)
+        sigma_total : sqrt(Var(eta) + E[omega^2])   (outer band half)      (T,)
+        sigma_eta   : sqrt(Var(eta))                                        (T,)
+    """
+    eta_bar = params.eta_bar
+    var_eta = _sigma_eta_diag(params)              # diag of Sigma_eta
+    E_omega2, _ = _omega2_prior_moments(params)
+    sigma_obs = np.sqrt(np.maximum(E_omega2, 0.0))
+    sigma_total = np.sqrt(np.maximum(var_eta + E_omega2, 0.0))
+    sigma_eta = np.sqrt(np.maximum(var_eta, 0.0))
+    return {
+        "center":      eta_bar,
+        "sigma_obs":   sigma_obs,
+        "sigma_total": sigma_total,
+        "sigma_eta":   sigma_eta,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Single-axes drawing (used by both public figure functions)
+# Computations: per-home posteriors under the fitted prior
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _draw_background_on_axes(
-    ax: Axes,
-    stats: dict,
-    home_color: str,
-    show_individual_traces: bool,
-    show_empirical_band: bool,
-    show_alpha_band: bool,
-    show_combined_band: bool,
-    max_trace_days: int,
-    title: str,
-    ylabel: str,
-    ylim: tuple[float, float] | None,
-    is_bottom_row: bool,
-) -> None:
-    """Draw all requested layers onto a single axes object."""
-    time_indices = np.arange(96)
-
-    # ── empirical / true-data layers ─────────────────────────────────────────
-    if show_individual_traces and stats["empirical_traces"] is not None:
-        traces = stats["empirical_traces"]
-        days_to_draw = min(max_trace_days, traces.shape[0])
-        sampled_day_indices = np.random.default_rng(0).choice(
-            traces.shape[0], days_to_draw, replace=False
+def _home_nev_array(home_df: pd.DataFrame, T: int) -> tuple[np.ndarray, int]:
+    """Return (x_nev with shape (D, T), D) for one home's rows of train_df."""
+    g = home_df.sort_values(["day", "time_index"])
+    D = g["day"].nunique()
+    if len(g) != D * T:
+        raise ValueError(
+            f"home has {len(g)} rows, expected D*T = {D*T} (incomplete days?)"
         )
-        for day_index in sampled_day_indices:
-            ax.plot(time_indices, traces[day_index], color=home_color, alpha=0.04, lw=0.5)
-
-    if show_empirical_band and stats["empirical_mean"] is not None:
-        ax.plot(
-            time_indices, stats["empirical_mean"],
-            color=home_color, alpha=0.85, lw=1.8, ls="--",
-            label="empirical mean",
-        )
-        ax.fill_between(
-            time_indices,
-            stats["empirical_mean"] - stats["empirical_std"],
-            stats["empirical_mean"] + stats["empirical_std"],
-            color=home_color, alpha=0.18, label="empirical ±1σ",
-        )
-
-    # ── model prediction layers ───────────────────────────────────────────────
-    # Draw wider (combined) band first so alpha band appears on top
-    if show_combined_band:
-        ax.fill_between(
-            time_indices,
-            stats["combined_band_lo"], stats["combined_band_hi"],
-            color=home_color, alpha=0.15,
-            label=r"model: $\alpha$ + $\sigma^{\mathrm{NonEV}}$ band",
-        )
-
-    if show_alpha_band:
-        ax.fill_between(
-            time_indices,
-            stats["alpha_only_band_lo"], stats["alpha_only_band_hi"],
-            color=home_color, alpha=0.35,
-            label=r"model: $\alpha$-only band",
-        )
-
-    # Model mean always shown
-    ax.plot(
-        time_indices, stats["model_mean"],
-        color=home_color, lw=1.5, ls="-", alpha=1.0,
-        label="model mean",
-    )
-
-    # ── axes formatting ───────────────────────────────────────────────────────
-    ax.set_title(title, fontsize=9, loc="left", pad=3)
-    ax.set_ylabel(ylabel, fontsize=8)
-    ax.legend(fontsize=6, loc="upper left", framealpha=0.7, ncol=2)
-    ax.grid(axis="y", lw=0.3, alpha=0.4)
-    ax.grid(axis="x", lw=0.2, alpha=0.3)
-    if ylim is not None:
-        ax.set_ylim(ylim)
-    if is_bottom_row:
-        _apply_hourly_time_axis(ax)
-        ax.set_xlabel("Time of day", fontsize=8)
-    else:
-        ax.set_xticks([])
+    return g["non_ev_load"].to_numpy().reshape(D, T).astype(np.float64), D
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Public: stacked time-series comparison
-# ─────────────────────────────────────────────────────────────────────────────
+def _sigma_eta_inv(params) -> np.ndarray:
+    """Compute Sigma_eta^{-1} via Woodbury identity. (T, T)."""
+    W = params.W_eta
+    psi = params.psi_eta
+    T_ = psi.shape[0]
+    r = W.shape[1]
+    inv_psi = 1.0 / psi
+    if r == 0:
+        return np.diag(inv_psi)
+    M = np.eye(r) + W.T @ (inv_psi[:, None] * W)
+    WP = inv_psi[:, None] * W
+    return np.diag(inv_psi) - WP @ np.linalg.solve(M, WP.T)
 
-def plot_background_comparison(
-    train_df: pd.DataFrame,
+
+def compute_home_background_posterior(
+    home_df: pd.DataFrame,
     params,
-    home_ids: list[int],
     *,
-    show_individual_traces: bool = True,
-    show_empirical_band: bool = True,
-    show_alpha_band: bool = True,
-    show_combined_band: bool = True,
-    max_trace_days: int = 60,
-    row_height: float = 2.8,
-    figure_width: float = 13.0,
-    colormap_name: str = "tab20",
-) -> Figure:
-    """Stacked single-column figure: one row per home + one row for the prior.
+    Sigma_eta_inv: np.ndarray | None = None,
+) -> dict:
+    """All quantities needed for the per-home background diagnostic plot.
 
-    All time-series rows share the same absolute kW y-axis.
+    The posterior is computed under the fitted prior, conditioning on the
+    home's empirical (omega_hat)^2 as the noise scale. This is the same
+    plug-in used at Gibbs initialization; with D ≈ 365 obs per t, the
+    coupling between eta and omega in the joint posterior is weak.
 
-    Parameters
-    ----------
-    home_ids : list of home_id values to include.
-    show_individual_traces : draw faint individual daily traces.
-    show_empirical_band    : draw empirical mean ± 1 std.
-    show_alpha_band        : draw model band from alpha uncertainty alone.
-    show_combined_band     : draw model band from alpha + nonev noise.
-    max_trace_days         : max individual day traces drawn per home (random sample).
+    Returns:
+        empirical_mean : (T,)  hat_eta^(n) = mean over days
+        empirical_std  : (T,)  hat_omega^(n) = std over days (ddof=0)
+        D              : int   number of days
+        posterior_eta_mean : (T,)  MAP/mean of eta posterior (Gaussian)
+        posterior_eta_std  : (T,)  sqrt(diag(Lambda^{-1}))
+        posterior_omega_map: (T,)  MAP of omega from IG posterior (mode of
+                                    sqrt-scale; i.e. sqrt of IG mode)
     """
-    num_homes = len(home_ids)
-    num_rows  = num_homes + 1   # homes + prior
+    T_ = params.T
+    x_nev, D = _home_nev_array(home_df, T_)
 
-    colormap = plt.get_cmap(colormap_name)
-    home_colors = [colormap(i / max(num_homes - 1, 1)) for i in range(num_homes)]
+    emp_mean = x_nev.mean(axis=0)                  # (T,)
+    emp_var  = x_nev.var(axis=0, ddof=0)           # (T,)
+    emp_std  = np.sqrt(emp_var)
 
-    # ── compute stats ─────────────────────────────────────────────────────────
-    all_home_stats = {}
-    for home_id in home_ids:
-        home_df = train_df[train_df["home_id"] == home_id]
-        all_home_stats[home_id] = compute_home_background_stats(home_df, params)
+    if Sigma_eta_inv is None:
+        Sigma_eta_inv = _sigma_eta_inv(params)
 
-    prior_stats = compute_prior_background_stats(params)
+    # Posterior over eta given hat_omega = empirical std
+    omega2 = np.maximum(emp_var, 1e-12)            # (T,)
+    Lambda = Sigma_eta_inv.copy()
+    Lambda.flat[::T_ + 1] += D / omega2            # add D/omega^2 to diagonal
+    h = Sigma_eta_inv @ params.eta_bar + D * emp_mean / omega2
 
-    # ── shared y-axis limits ──────────────────────────────────────────────────
-    # Use the empirical band (if available) and model bands to set scale
-    all_lower_values = [prior_stats["combined_band_lo"].min()]
-    all_upper_values = [prior_stats["combined_band_hi"].max()]
-    for stats in all_home_stats.values():
-        all_lower_values.append(stats["combined_band_lo"].min())
-        all_upper_values.append(stats["combined_band_hi"].max())
-        if stats["empirical_mean"] is not None:
-            all_lower_values.append((stats["empirical_mean"] - stats["empirical_std"]).min())
-            all_upper_values.append((stats["empirical_mean"] + stats["empirical_std"]).max())
-    y_min = min(all_lower_values) * 0.9
-    y_max = max(all_upper_values) * 1.08
-    shared_ylim = (max(0.0, y_min), y_max)   # load is non-negative
+    L = np.linalg.cholesky(Lambda)
+    post_eta_mean = np.linalg.solve(L.T, np.linalg.solve(L, h))
+    # Posterior covariance Lambda^{-1}; diagonal via column-wise solve
+    eye_T = np.eye(T_)
+    Lambda_inv = np.linalg.solve(L.T, np.linalg.solve(L, eye_T))
+    post_eta_std = np.sqrt(np.maximum(np.diag(Lambda_inv), 0.0))
 
-    # ── build figure ──────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(
-        num_rows, 1,
-        figsize=(figure_width, row_height * num_rows),
-        sharex=False,   # x-axis formatted manually; only bottom row gets labels
+    # Posterior over omega^2 given eta = post_eta_mean
+    ss_resid = ((x_nev - post_eta_mean[None, :]) ** 2).sum(axis=0)  # (T,)
+    a_post = params.a_omega + D / 2.0
+    b_post = params.b_omega + 0.5 * ss_resid
+    # IG mode = b / (a + 1); take sqrt for omega
+    omega2_map = b_post / (a_post + 1.0)
+    omega_map = np.sqrt(np.maximum(omega2_map, 0.0))
+
+    return {
+        "empirical_mean":     emp_mean,
+        "empirical_std":      emp_std,
+        "D":                  D,
+        "posterior_eta_mean": post_eta_mean,
+        "posterior_eta_std":  post_eta_std,
+        "posterior_omega_map": omega_map,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 1: prior predictive (standalone)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_prior_predictive(
+    params,
+    *,
+    figsize: tuple[float, float] = (8.5, 4.0),
+) -> Figure:
+    """Prior predictive envelope for a new home (one observation, one timestep).
+
+      center      = eta_bar
+      inner band  = center +/- sqrt(E[omega^2])                  (avg per-obs noise)
+      outer band  = center +/- sqrt(Var(eta) + E[omega^2])       (total predictive)
+    """
+    pp = compute_prior_predictive(params)
+    t = np.arange(params.T)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Outer band first so it sits behind
+    ax.fill_between(
+        t,
+        pp["center"] - pp["sigma_total"],
+        pp["center"] + pp["sigma_total"],
+        alpha=0.18, color="C0",
+        label=r"$\bar\eta_t \pm \sqrt{\mathrm{Var}(\eta_t) + \mathbb{E}[\omega_t^2]}$  (total)",
     )
-    if num_rows == 1:
-        axes = [axes]
-
-    # Draw home rows
-    for row_index, (home_id, home_color) in enumerate(zip(home_ids, home_colors)):
-        stats   = all_home_stats[home_id]
-        is_ev   = stats["has_ev"]
-        title   = (
-            f"Home {home_id}  "
-            f"({'EV' if is_ev else 'non-EV'}, {stats['num_days']} days)  "
-            f"  α̂ = {stats['posterior_alpha_mean']:.2f} kW"
-        )
-        _draw_background_on_axes(
-            ax                     = axes[row_index],
-            stats                  = stats,
-            home_color             = home_color,
-            show_individual_traces = show_individual_traces,
-            show_empirical_band    = show_empirical_band,
-            show_alpha_band        = show_alpha_band,
-            show_combined_band     = show_combined_band,
-            max_trace_days         = max_trace_days,
-            title                  = title,
-            ylabel                 = "kW",
-            ylim                   = shared_ylim,
-            is_bottom_row          = False,
-        )
-
-    # Draw prior row (last)
-    prior_color = "dimgray"
-    _draw_background_on_axes(
-        ax                     = axes[-1],
-        stats                  = prior_stats,
-        home_color             = prior_color,
-        show_individual_traces = False,   # no individual traces for prior
-        show_empirical_band    = False,
-        show_alpha_band        = show_alpha_band,
-        show_combined_band     = show_combined_band,
-        max_trace_days         = 0,
-        title                  = (
-            f"Prior predictive  "
-            f"  μ_α = {params.mu_alpha:.2f} kW,  σ_α = {np.sqrt(params.sigma2_alpha):.2f} kW"
-        ),
-        ylabel                 = "kW",
-        ylim                   = shared_ylim,
-        is_bottom_row          = True,
+    ax.fill_between(
+        t,
+        pp["center"] - pp["sigma_obs"],
+        pp["center"] + pp["sigma_obs"],
+        alpha=0.30, color="C0",
+        label=r"$\bar\eta_t \pm \sqrt{\mathbb{E}[\omega_t^2]}$  (noise only)",
     )
+    ax.plot(t, pp["center"], color="C0", lw=1.8, label=r"$\bar\eta_t$  (prior mean)")
 
-    fig.suptitle("Non-EV background load: empirical vs model", fontsize=11, y=1.002)
+    ax.axhline(0, color="k", lw=0.4)
+    ax.set_xlabel("Time of day")
+    ax.set_ylabel("Non-EV load (kW)")
+    ax.set_title(
+        f"Prior predictive for a new home  "
+        f"(PPCA rank r={params.ppca_rank}, T={params.T})"
+    )
+    _apply_hourly_time_axis(ax)
+    ax.legend(loc="upper left", fontsize=8, frameon=False)
     plt.tight_layout()
     return fig
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public: alpha posterior forest plot
+# Plot 2: per-home empirical vs posterior (stacked)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_alpha_posteriors(
+def plot_background_per_home(
     train_df: pd.DataFrame,
     params,
-    home_ids: list[int],
+    home_ids: Sequence[int],
     *,
-    figure_width: float = 11.0,
-    figure_height: float = 5.0,
-    colormap_name: str = "tab20",
+    show_individual_traces: bool = False,
+    max_trace_days: int = 50,
+    panel_height: float = 1.9,
+    fig_width: float = 11.0,
 ) -> Figure:
-    """Forest plot: posterior alpha ± 1 std for each home, plus the prior.
+    """Stacked: per-home empirical envelope vs posterior MAP envelope.
 
-    x-axis  : x=0 is the global prior; x=1,2,... are individual homes.
-    y-axis  : alpha in kW (the per-home background scale factor).
+    For each home, one panel:
+      solid line  + light fill : empirical mean +/- empirical std (per t)
+      dashed line + hatched    : posterior MAP eta +/- posterior MAP omega
+                                  (the "model's best guess" under the prior)
 
-    Note: posterior stds are typically tiny (~0.05 kW) because D*T >> 1,
-    so home error bars appear nearly as points compared to the prior CI.
+    The posterior-MAP envelope is what the prior-constrained model predicts
+    a single observation will look like. When the prior is rigid (small r,
+    small psi), the dashed line shrinks toward eta_bar; when the prior is
+    permissive, dashed ≈ solid.
+
+    All panels share an absolute kW y-axis for cross-home comparability.
     """
-    colormap   = plt.get_cmap(colormap_name)
-    num_homes  = len(home_ids)
-    home_colors = [colormap(i / max(num_homes - 1, 1)) for i in range(num_homes)]
+    Sigma_eta_inv = _sigma_eta_inv(params)
+    home_ids = list(home_ids)
+    n_panels = len(home_ids)
 
-    # Compute posteriors
-    posterior_means = []
-    posterior_stds  = []
-    for home_id in home_ids:
-        home_df = train_df[train_df["home_id"] == home_id]
-        stats   = compute_home_background_stats(home_df, params)
-        posterior_means.append(stats["posterior_alpha_mean"])
-        posterior_stds.append(stats["posterior_alpha_std"])
+    # Pre-compute per-home stats so we can set a shared y-range
+    per_home = []
+    y_lo, y_hi = +np.inf, -np.inf
+    for hid in home_ids:
+        g = train_df[train_df["home_id"] == hid]
+        if g.empty:
+            raise ValueError(f"home_id {hid} not in train_df")
+        stats_d = compute_home_background_posterior(g, params, Sigma_eta_inv=Sigma_eta_inv)
+        per_home.append((hid, g, stats_d))
+        lo = min(
+            (stats_d["empirical_mean"] - stats_d["empirical_std"]).min(),
+            (stats_d["posterior_eta_mean"] - stats_d["posterior_omega_map"]).min(),
+        )
+        hi = max(
+            (stats_d["empirical_mean"] + stats_d["empirical_std"]).max(),
+            (stats_d["posterior_eta_mean"] + stats_d["posterior_omega_map"]).max(),
+        )
+        y_lo = min(y_lo, lo)
+        y_hi = max(y_hi, hi)
+    pad = 0.05 * (y_hi - y_lo)
+    y_lo -= pad
+    y_hi += pad
 
-    prior_mean = params.mu_alpha
-    prior_std  = float(np.sqrt(params.sigma2_alpha))
-
-    # x positions: 0 = prior, 1..N = homes
-    x_positions  = list(range(num_homes + 1))
-    x_prior      = 0
-    x_homes      = list(range(1, num_homes + 1))
-    x_tick_labels = ["prior"] + [str(h) for h in home_ids]
-
-    fig, ax = plt.subplots(figsize=(figure_width, figure_height))
-
-    # Prior: wide shaded band to make the CI visible at this scale
-    ax.axhspan(
-        prior_mean - prior_std, prior_mean + prior_std,
-        alpha=0.12, color="dimgray", label=f"prior ±1σ  (σ_α={prior_std:.2f} kW)",
+    fig, axes = plt.subplots(
+        n_panels, 1, figsize=(fig_width, panel_height * n_panels),
+        sharex=True, sharey=True,
     )
-    ax.errorbar(
-        x_prior, prior_mean, yerr=prior_std,
-        fmt="D", color="dimgray", capsize=6, capthick=1.5, elinewidth=1.5, ms=7,
-        label=f"prior mean (μ_α={prior_mean:.2f} kW)",
-        zorder=5,
-    )
+    if n_panels == 1:
+        axes = [axes]
 
-    # Home posteriors
-    for x_pos, home_id, post_mean, post_std, home_color in zip(
-        x_homes, home_ids, posterior_means, posterior_stds, home_colors
-    ):
-        is_ev = bool(train_df[train_df["home_id"] == home_id]["has_ev"].iloc[0])
-        marker = "^" if is_ev else "o"
-        ax.errorbar(
-            x_pos, post_mean, yerr=post_std,
-            fmt=marker, color=home_color,
-            capsize=4, capthick=1.2, elinewidth=1.2, ms=7,
-            label=f"{home_id}{'*' if is_ev else ''}",
-            zorder=4,
+    t = np.arange(params.T)
+
+    for ax, (hid, g, d) in zip(axes, per_home):
+        # Optional faint individual day traces
+        if show_individual_traces:
+            x_nev, D = _home_nev_array(g, params.T)
+            n_show = min(D, max_trace_days)
+            for row in x_nev[:n_show]:
+                ax.plot(t, row, color="0.7", lw=0.4, alpha=0.4)
+
+        # Empirical mean + band
+        ax.fill_between(
+            t,
+            d["empirical_mean"] - d["empirical_std"],
+            d["empirical_mean"] + d["empirical_std"],
+            alpha=0.22, color="C0",
+            label="empirical $\\pm$ day-std" if ax is axes[0] else None,
+        )
+        ax.plot(
+            t, d["empirical_mean"], color="C0", lw=1.5,
+            label="empirical mean" if ax is axes[0] else None,
         )
 
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels(x_tick_labels, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("α (kW)", fontsize=9)
-    ax.set_xlabel("Home ID  (* = EV home)  |  x=0 is the global prior", fontsize=8)
-    ax.set_title(
-        "Per-home posterior α ± 1σ  vs  global prior\n"
-        "(posterior stds are tiny because D·T ≫ 1; home dots appear near-pointlike)",
-        fontsize=9,
-    )
-    ax.legend(fontsize=7, loc="upper right", framealpha=0.8, ncol=3)
-    ax.grid(axis="y", lw=0.4, alpha=0.4)
-    ax.grid(axis="x", lw=0.3, alpha=0.25)
+        # Posterior MAP mean + omega-MAP band
+        ax.fill_between(
+            t,
+            d["posterior_eta_mean"] - d["posterior_omega_map"],
+            d["posterior_eta_mean"] + d["posterior_omega_map"],
+            alpha=0.20, color="C3", hatch="///", edgecolor="C3", linewidth=0,
+            label=r"posterior MAP $\eta \pm$ MAP $\omega$" if ax is axes[0] else None,
+        )
+        ax.plot(
+            t, d["posterior_eta_mean"], color="C3", lw=1.4, ls="--",
+            label=r"posterior MAP $\eta$" if ax is axes[0] else None,
+        )
 
+        has_ev = bool(g["has_ev"].iloc[0])
+        ax.set_title(f"home {hid}   D={d['D']}   {'EV' if has_ev else 'non-EV'}",
+                     fontsize=9, loc="left")
+        ax.axhline(0, color="k", lw=0.3)
+        ax.set_ylabel("kW", fontsize=8)
+        ax.set_ylim(y_lo, y_hi)
+
+    axes[0].legend(loc="upper left", fontsize=7, frameon=False, ncol=2)
+    _apply_hourly_time_axis(axes[-1])
+    axes[-1].set_xlabel("Time of day")
+    fig.suptitle(
+        f"Background per-home: empirical (solid) vs posterior-MAP under "
+        f"prior (dashed, r={params.ppca_rank})",
+        fontsize=10,
+    )
+    plt.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 3: eta distribution comparison
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_eta_per_home(
+    train_df: pd.DataFrame,
+    params,
+    home_ids: Sequence[int],
+    *,
+    panel_height: float = 1.9,
+    fig_width: float = 11.0,
+) -> Figure:
+    """Per-home empirical mean profile vs prior distribution on eta.
+
+    Shows: does this home's mean profile fall within the prior's typical
+    envelope of per-home mean profiles?
+
+      prior center   : eta_bar
+      prior band     : eta_bar +/- sqrt(Var(eta_t))   (Sigma_eta diagonal)
+      empirical line : hat_eta^(n)_t (mean over days, single home)
+    """
+    home_ids = list(home_ids)
+    n_panels = len(home_ids)
+    t = np.arange(params.T)
+
+    eta_bar = params.eta_bar
+    sigma_eta = np.sqrt(np.maximum(_sigma_eta_diag(params), 0.0))
+
+    fig, axes = plt.subplots(
+        n_panels, 1, figsize=(fig_width, panel_height * n_panels),
+        sharex=True, sharey=True,
+    )
+    if n_panels == 1:
+        axes = [axes]
+
+    for ax, hid in zip(axes, home_ids):
+        g = train_df[train_df["home_id"] == hid]
+        if g.empty:
+            raise ValueError(f"home_id {hid} not in train_df")
+        x_nev, D = _home_nev_array(g, params.T)
+        emp_mean = x_nev.mean(axis=0)
+
+        ax.fill_between(
+            t, eta_bar - sigma_eta, eta_bar + sigma_eta,
+            alpha=0.25, color="C0",
+            label=r"$\bar\eta \pm \sqrt{\mathrm{Var}(\eta_t)}$  (prior)" if ax is axes[0] else None,
+        )
+        ax.plot(t, eta_bar, color="C0", lw=1.5, ls="--",
+                label=r"$\bar\eta$  (prior mean)" if ax is axes[0] else None)
+        ax.plot(t, emp_mean, color="C3", lw=1.4,
+                label=r"$\hat\eta^{(n)}$  (empirical)" if ax is axes[0] else None)
+
+        has_ev = bool(g["has_ev"].iloc[0])
+        ax.set_title(f"home {hid}   D={D}   {'EV' if has_ev else 'non-EV'}",
+                     fontsize=9, loc="left")
+        ax.axhline(0, color="k", lw=0.3)
+        ax.set_ylabel("kW", fontsize=8)
+
+    axes[0].legend(loc="upper left", fontsize=7, frameon=False, ncol=3)
+    _apply_hourly_time_axis(axes[-1])
+    axes[-1].set_xlabel("Time of day")
+    fig.suptitle(
+        r"Per-home empirical $\hat\eta^{(n)}$ vs prior distribution on $\eta$",
+        fontsize=10,
+    )
+    plt.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 4: omega distribution comparison
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_omega_per_home(
+    train_df: pd.DataFrame,
+    params,
+    home_ids: Sequence[int],
+    *,
+    panel_height: float = 1.9,
+    fig_width: float = 11.0,
+) -> Figure:
+    """Per-home empirical std profile vs prior distribution on omega.
+
+    Shows: does this home's noise profile fall within the prior's typical
+    envelope of per-home noise profiles?
+
+      prior center : sqrt(E[omega^2])                     (prior mean of omega)
+      prior band   : [16th, 84th] percentiles of omega under IG prior
+                      (computed as sqrt of IG quantiles for omega^2)
+      empirical    : hat_omega^(n) = empirical std across days
+    """
+    home_ids = list(home_ids)
+    n_panels = len(home_ids)
+    t = np.arange(params.T)
+
+    E_omega2, _ = _omega2_prior_moments(params)
+    omega_mean = np.sqrt(np.maximum(E_omega2, 0.0))
+    omega_lo, omega_hi = _omega_prior_quantiles(params)
+
+    fig, axes = plt.subplots(
+        n_panels, 1, figsize=(fig_width, panel_height * n_panels),
+        sharex=True, sharey=True,
+    )
+    if n_panels == 1:
+        axes = [axes]
+
+    for ax, hid in zip(axes, home_ids):
+        g = train_df[train_df["home_id"] == hid]
+        if g.empty:
+            raise ValueError(f"home_id {hid} not in train_df")
+        x_nev, D = _home_nev_array(g, params.T)
+        emp_std = np.sqrt(x_nev.var(axis=0, ddof=0))
+
+        ax.fill_between(
+            t, omega_lo, omega_hi,
+            alpha=0.25, color="C0",
+            label=r"$\omega_t$ prior 16/84%" if ax is axes[0] else None,
+        )
+        ax.plot(t, omega_mean, color="C0", lw=1.5, ls="--",
+                label=r"$\sqrt{\mathbb{E}[\omega_t^2]}$  (prior mean)" if ax is axes[0] else None)
+        ax.plot(t, emp_std, color="C3", lw=1.4,
+                label=r"$\hat\omega^{(n)}$  (empirical)" if ax is axes[0] else None)
+
+        has_ev = bool(g["has_ev"].iloc[0])
+        ax.set_title(f"home {hid}   D={D}   {'EV' if has_ev else 'non-EV'}",
+                     fontsize=9, loc="left")
+        ax.set_ylabel("kW", fontsize=8)
+        ax.set_ylim(bottom=0)
+
+    axes[0].legend(loc="upper right", fontsize=7, frameon=False, ncol=3)
+    _apply_hourly_time_axis(axes[-1])
+    axes[-1].set_xlabel("Time of day")
+    fig.suptitle(
+        r"Per-home empirical $\hat\omega^{(n)}$ vs prior distribution on $\omega$",
+        fontsize=10,
+    )
+    plt.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 5: inference diagnostic — inferred posterior vs ground-truth x_Non-EV
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_inference_vs_truth(
+    test_df: pd.DataFrame,
+    inference,
+    params,
+    home_id: int,
+    *,
+    figsize: tuple[float, float] = (11.0, 8.0),
+) -> Figure:
+    """Compare the inferred (eta, omega) posterior to the ground-truth x_Non-EV.
+
+    Three stacked panels for one home:
+      1. Mean profile  : true x_Non-EV day-mean (solid + day-std band) overlaid
+                          on inferred eta posterior mean (dashed + posterior std band).
+                          Answers: "did the model recover the home's mean shape?"
+      2. Std profile   : true x_Non-EV day-std (solid) overlaid on inferred omega
+                          posterior mean and 16/84% band.
+                          Answers: "did the model recover the home's noise scale?"
+      3. z-error rates : per-timestep false-positive (truth=off, pred=charging)
+                          and false-negative (truth=charging, pred=off) rates,
+                          across days. Useful to see whether mis-classifications
+                          line up with where eta inference deviates from truth.
+
+    Requires `non_ev_load` and `charge_state` to be present in test_df (ground
+    truth columns).
+    """
+    g = test_df[test_df["home_id"] == home_id].sort_values(["day", "time_index"])
+    if g.empty:
+        raise ValueError(f"home_id {home_id} not in test_df")
+    T_ = params.T
+    D = g["day"].nunique()
+
+    x_nev_true = g["non_ev_load"].to_numpy().reshape(D, T_).astype(np.float64)
+    z_true     = g["charge_state"].to_numpy().reshape(D, T_).astype(np.int64)
+    has_ev     = bool(g["has_ev"].iloc[0])
+
+    # Truth stats
+    emp_mean = x_nev_true.mean(axis=0)
+    emp_std  = x_nev_true.std(axis=0, ddof=0)
+
+    # Inferred eta posterior summaries (over retained Gibbs samples)
+    if inference.eta_samples is None or inference.omega2_samples is None:
+        raise ValueError(
+            f"home {home_id}: inference has no eta_samples/omega2_samples — "
+            f"was it run with retained samples?"
+        )
+    eta_mean = inference.eta_samples.mean(axis=0)
+    eta_std  = inference.eta_samples.std(axis=0, ddof=0)
+
+    omega_samples = np.sqrt(np.maximum(inference.omega2_samples, 0.0))   # (S, T)
+    omega_post_mean = omega_samples.mean(axis=0)
+    omega_post_lo, omega_post_hi = np.quantile(omega_samples, [0.16, 0.84], axis=0)
+
+    z_hat = inference.z_hat                                              # (D, T)
+    fp_rate = ((z_hat != 0) & (z_true == 0)).mean(axis=0)                # (T,)
+    fn_rate = ((z_hat == 0) & (z_true != 0)).mean(axis=0)                # (T,)
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=figsize, sharex=True,
+        gridspec_kw={"height_ratios": [2.2, 1.6, 1.0]},
+    )
+    t = np.arange(T_)
+
+    # ─── Panel 1: mean ──────────────────────────────────────────────────────
+    ax = axes[0]
+    ax.fill_between(
+        t, emp_mean - emp_std, emp_mean + emp_std,
+        alpha=0.22, color="C0",
+        label=r"true $x^{\mathrm{Non\text{-}EV}}$ mean $\pm$ empirical day-std",
+    )
+    ax.plot(t, emp_mean, color="C0", lw=1.6)
+    ax.fill_between(
+        t, eta_mean - eta_std, eta_mean + eta_std,
+        alpha=0.22, color="C3", hatch="///", edgecolor="C3", linewidth=0,
+        label=r"inferred $\eta$ posterior mean $\pm$ posterior std",
+    )
+    ax.plot(t, eta_mean, color="C3", lw=1.5, ls="--")
+    ax.axhline(0, color="k", lw=0.3)
+    ax.set_ylabel("kW (mean profile)")
+    ax.set_title(
+        f"home {home_id}   D={D}   {'EV' if has_ev else 'non-EV'}   "
+        f"C_hat={inference.C_hat}   "
+        f"(true C={int(has_ev)})",
+        loc="left", fontsize=10,
+    )
+    ax.legend(loc="upper left", fontsize=8, frameon=False)
+
+    # ─── Panel 2: std ───────────────────────────────────────────────────────
+    ax = axes[1]
+    ax.plot(t, emp_std, color="C0", lw=1.6,
+            label=r"true $x^{\mathrm{Non\text{-}EV}}$ empirical day-std")
+    ax.fill_between(
+        t, omega_post_lo, omega_post_hi,
+        alpha=0.22, color="C3",
+        label=r"inferred $\omega$ posterior 16/84%",
+    )
+    ax.plot(t, omega_post_mean, color="C3", lw=1.5, ls="--",
+            label=r"inferred $\omega$ posterior mean")
+    ax.set_ylabel("kW (std profile)")
+    ax.set_ylim(bottom=0)
+    ax.legend(loc="upper left", fontsize=8, frameon=False)
+
+    # ─── Panel 3: z-error rates per timestep ────────────────────────────────
+    ax = axes[2]
+    ax.bar(t, fp_rate, width=0.9, color="C1", alpha=0.75,
+           label="FP rate  (truth=off, pred=charging)")
+    ax.bar(t, -fn_rate, width=0.9, color="C2", alpha=0.75,
+           label="FN rate  (truth=charging, pred=off)")
+    ax.axhline(0, color="k", lw=0.4)
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_ylabel("fraction of days")
+    ax.legend(loc="upper left", fontsize=7, frameon=False, ncol=2)
+
+    _apply_hourly_time_axis(axes[-1])
+    axes[-1].set_xlabel("Time of day")
     plt.tight_layout()
     return fig
