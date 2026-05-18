@@ -64,6 +64,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 from scipy.special import logsumexp
+from scipy.stats import norm, truncnorm
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +92,16 @@ SLICE_MAX_SHRINK = 50          # safety cap on shrinkage iterations
 
 # Numerical guards for IG MoM (avoid degenerate a values)
 IG_MIN_SHAPE = 2.01            # a > 2 required for finite IG variance
+
+# State-magnitude semantics: define which range of kW each EV state represents.
+# Encoded as truncation on the Theta^(n)_k prior (see specs/model.md §1.5).
+# Index matches state index: 0=off, 1=low, 2=high. Off is pinned at 0 and
+# the bound is unused.
+THETA_BOUNDS = [
+    (0.0, 0.0),        # off    — Theta_off pinned to 0
+    (0.1, 2.0),        # low    — 0.1 kW ≤ Theta_low ≤ 2 kW
+    (2.0, np.inf),     # high   — Theta_high ≥ 2 kW
+]
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +765,18 @@ def _fit_charging_em(home_arrays: dict, ev_homes: list[int], *, verbose: bool):
         sigma2_theta[k] = max(sigma2_theta_k, 0.0)
         sigma2_ev[k] = sigma2_ev_k
 
+        if verbose:
+            lb, ub = THETA_BOUNDS[k]
+            sd = np.sqrt(max(sigma2_theta_k, THETA_VAR_FLOOR))
+            # Prior probability mass inside the state-magnitude bounds [lb, ub].
+            # Low values (<~0.5) mean the untruncated prior puts most of its
+            # mass outside the bound; the truncated posterior will be
+            # numerically OK but the prior is barely informative inside [lb, ub].
+            mass_in = float(norm.cdf((ub - mu_theta_k) / sd) - norm.cdf((lb - mu_theta_k) / sd))
+            print(f"  Theta_{STATE_NAMES[k]} bound [{lb}, {ub}]: "
+                  f"prior mass in band = {mass_in:.3f} "
+                  f"(mu={mu_theta_k:.3f}, sigma_Theta={sd:.3f})")
+
     return mu_theta, sigma2_theta, sigma2_ev
 
 
@@ -1175,19 +1198,25 @@ def _sample_theta_k(
     k:      int,
     rng,
 ) -> float:
-    """Sample Theta_k from its conditional Gaussian under the marginal model:
+    """Sample Theta_k from its conditional truncated-Normal under the marginal
+    model:
 
         x[d,t] - eta[t]  ~  N( Theta_k, sigma2_ev[k] + omega2[t] )  for (d,t) ∈ T_k
+        Theta_k          ~  N( mu_theta_k, sigma2_theta_k ) · 1[Theta_k ∈ [lb, ub]]
 
+    The Gaussian-prior × Gaussian-likelihood conjugate update gives an untruncated
+    posterior N(m, 1/prec); the prior's truncation indicator multiplies through
+    unchanged, so the posterior is the *same* normal truncated to [lb, ub].
     Heteroscedastic across (d,t) because the variance depends only on t once
     we condition on z[d,t]=k, but t varies within the masked set.
     """
     sigma2_ev_k = params.sigma2_ev[k]
     sig2_prior  = max(params.sigma2_theta[k], THETA_VAR_FLOOR)
+    lb, ub      = THETA_BOUNDS[k]
 
     mask = (z == k)                                              # (D, T)
     if not mask.any():
-        return rng.normal(params.mu_theta[k], np.sqrt(sig2_prior))
+        return _truncnorm_sample(params.mu_theta[k], np.sqrt(sig2_prior), lb, ub, rng)
 
     var_t   = sigma2_ev_k + omega2                                # (T,)
     inv_var_t = 1.0 / var_t                                       # (T,)
@@ -1199,7 +1228,14 @@ def _sample_theta_k(
 
     prec = 1.0 / sig2_prior + S_inv_var
     m    = (params.mu_theta[k] / sig2_prior + S_r) / prec
-    return rng.normal(m, np.sqrt(1.0 / prec))
+    return _truncnorm_sample(m, np.sqrt(1.0 / prec), lb, ub, rng)
+
+
+def _truncnorm_sample(mean: float, sd: float, lb: float, ub: float, rng) -> float:
+    """Draw one sample from N(mean, sd^2) truncated to [lb, ub]. lb/ub may be inf."""
+    a = (lb - mean) / sd
+    b = (ub - mean) / sd
+    return float(truncnorm.rvs(a, b, loc=mean, scale=sd, random_state=rng))
 
 
 # ---------------------------------------------------------------------------

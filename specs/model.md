@@ -40,25 +40,27 @@ The **deprecated** rank-1 form (§2.7) replaces $\eta^{(n)}_t \to \alpha^{(n)}\r
 and $(\omega^{(n)}_t)^2 \to (\sigma^{\text{Non-EV}}_t)^2$.
 
 > **Implementation status.** The code in [`graphical_model.py`](../models/graphical_model.py)
-> currently implements the deprecated rank-1 form. The hierarchical-profile
-> form documented in §2.1–§2.6 is the design we are migrating to and is not
-> yet implemented. Code pointers in §2.1–§2.6 are therefore aspirational
-> ("will live in …"); those in §2.7 reflect the actual current code.
+> implements the hierarchical-profile form documented in §2.1–§2.6. The
+> deprecated rank-1 form (§2.7) has been removed from the code and is kept
+> here as historical contrast only. Two parameterizations of the variance
+> profile $\omega$ are supported (selected by `omega_mode` in
+> [`ModelParams`](../models/graphical_model.py#L100)) — see §2.3.
 
 ### Phase summary
 
-- **Fit** ([`fit()`](../models/graphical_model.py#L129)) uses fully-labeled
+- **Fit** ([`fit()`](../models/graphical_model.py#L264)) uses fully-labeled
   training data — $C^{(n)}$, $z^{(n)}_{d,t}$, $x^{\text{EV}}$, $x^{\text{Non-EV}}$,
-  and $x$ are all observed — to estimate the ~11 global parameter blocks in
-  closed form (apart from a short EM loop for the charging-magnitude block).
-  Output is a [`ModelParams`](../models/graphical_model.py#L37) dataclass.
-- **Inference** ([`infer_all()`](../models/graphical_model.py#L816)) sees only
+  and $x$ are all observed — to estimate the global parameter blocks in
+  closed form (apart from a short EM loop for the charging-magnitude block
+  and a small PPCA fit for the $\eta$ prior).
+  Output is a [`ModelParams`](../models/graphical_model.py#L100) dataclass.
+- **Inference** ([`infer_all()`](../models/graphical_model.py#L1394)) sees only
   $x^{(n)}_{d,t}$. EV ownership $C^{(n)}$ is predicted by a heuristic
   ([`first_diff_logistic.predict`](../models/first_diff_logistic.py#L94)); the
-  remaining per-home latents ($z, \alpha, \Theta$) are Gibbs-sampled per home
-  via [`infer_home()`](../models/graphical_model.py#L490).
-- **Evaluation** ([`evaluate()`](../models/graphical_model.py#L913),
-  [`print_evaluation()`](../models/graphical_model.py#L1088)) compares
+  remaining per-home latents ($z, \Theta, \eta$, and optionally $\omega$) are
+  Gibbs-sampled per home via [`infer_home()`](../models/graphical_model.py#L781).
+- **Evaluation** ([`evaluate()`](../models/graphical_model.py#L1686),
+  [`print_evaluation()`](../models/graphical_model.py#L1820)) compares
   $\hat C^{(n)}$ and $\hat z^{(n)}_{d,t}$ to ground truth via confusion matrices.
 
 ---
@@ -166,26 +168,59 @@ this household charge differently?" — that we don't currently care about).
 
 ### 1.5 $\Theta^{(n)}_k$ — per-home mean charging power in state $k$
 
-**Distribution.** $\Theta^{(n)}_k \stackrel{\text{iid}}{\sim} \mathcal{N}(\mu_{\Theta_k}, \sigma_{\Theta_k}^2)$
-for $k\in\{\texttt{low},\texttt{high}\}$, with the off-state pinned:
-$\Theta^{(n)}_{\texttt{off}}=0$, $\sigma_{\Theta_{\texttt{off}}}=0$.
+**Distribution.** $\Theta^{(n)}_k \stackrel{\text{iid}}{\sim} \mathcal{N}(\mu_{\Theta_k}, \sigma_{\Theta_k}^2) \cdot \mathbf{1}[\Theta^{(n)}_k \in B_k]$
+for $k\in\{\texttt{low},\texttt{high}\}$, i.e. a **truncated normal** with
+state-specific magnitude bounds
+
+$$B_{\texttt{low}} = [0.1,\ 2]\ \text{kW},\qquad B_{\texttt{high}} = [2,\ \infty)\ \text{kW}.$$
+
+The off-state is pinned: $\Theta^{(n)}_{\texttt{off}}=0$,
+$\sigma_{\Theta_{\texttt{off}}}=0$. The bounds encode the **definitional**
+semantics of "low" vs. "high" charging (the same cutoffs used to label states
+in the training data) directly into the prior — without them, an unconstrained
+$\mathcal{N}$ prior makes the two states statistically indistinguishable apart
+from the fitted hyperparameters, which is fragile at inference when the data
+is ambiguous. The bounds live in `THETA_BOUNDS` in
+[`graphical_model.py`](../models/graphical_model.py).
 
 **Fit.** Observed in training (since $z$ and $x^{\text{EV}}$ are both labeled,
 per-home means $\hat\theta^{(n)}_k = S_y^{(n)} / n^{(n)}_k$ are sufficient
 stats). The *hyperparameters* $\mu_{\Theta_k},\sigma_{\Theta_k}^2,\sigma^{\text{EV}}_k$
-are jointly fit by short EM — see §1.6.
+are jointly fit by short EM — see §1.6. The truncation is not modeled in EM
+(we treat $(\mu_{\Theta_k},\sigma_{\Theta_k}^2)$ as the parameters of the
+*underlying* untruncated Normal). Since labeled $\hat\theta^{(n)}_k$ values
+lie inside $B_k$ by construction of the labels, the bias from omitting the
+truncation normalizer in the M-step is small; verbose mode prints the
+fraction of *prior* probability mass inside $B_k$ as a sanity check.
 
-**Inference.** Gibbs block 2 inside [`infer_home()`](../models/graphical_model.py#L490).
-Conditional on current $z,\alpha$, observations in state $k$ are Gaussian with
-known mean offset and known per-time variance, giving a Gaussian-prior ×
-Gaussian-likelihood update with closed-form posterior:
+**Inference.** Gibbs block 2 inside [`infer_home()`](../models/graphical_model.py#L781).
+Conditional on current $z,\eta,\omega$, observations in state $k$ are
+Gaussian with known mean offset and known per-time variance, giving a
+truncated-Gaussian-prior × Gaussian-likelihood update. The indicator
+$\mathbf{1}[\Theta^{(n)}_k \in B_k]$ passes through the Gaussian conjugacy
+unchanged: the posterior is the *same* untruncated-conjugate Normal, truncated
+to $B_k$:
 
-$$\Theta^{(n)}_k \sim \mathcal{N}(m_k,\, 1/\text{prec}_k),\quad \text{prec}_k = \tfrac{1}{\sigma_{\Theta_k}^2} + \sum_{(d,t)\in\mathcal{T}_k}\tfrac{1}{\sigma^2_{k,t}}.$$
+$$\Theta^{(n)}_k \sim \mathcal{N}(m_k,\, 1/\text{prec}_k) \cdot \mathbf{1}[\Theta^{(n)}_k \in B_k],\quad \text{prec}_k = \tfrac{1}{\sigma_{\Theta_k}^2} + \sum_{(d,t)\in\mathcal{T}_k}\tfrac{1}{\sigma^2_{k,t}}.$$
 
+Sampled via `scipy.stats.truncnorm.rvs` ($O(1)$ per draw, inverse-CDF based).
 If $|\mathcal{T}_k|=0$ (no observations assigned to state $k$ in the current
-$z$), draw from the prior.
+$z$), draw from the truncated prior.
 
-**Code.** [`_sample_theta_k()`](../models/graphical_model.py#L789).
+**Why truncate the prior, not the emission?** Truncating the emission
+$x^{\text{EV}}_t | z_t{=}k$ would break FFBS marginalization: the convolution
+of a truncated $x^{\text{EV}}$ with Gaussian $x^{\text{Non-EV}}$ has no
+closed form, so the per-cell emission likelihood used by the HMM forward
+pass would need quadrature or moment-matching. Truncating only the per-home
+*mean* $\Theta^{(n)}_k$ leaves the conditional structure of every Gibbs block
+intact and addresses the most likely failure mode (the per-home mean drifting
+out of its semantic band under ambiguous data at inference). Individual
+emissions can still fall outside $B_k$ via $\sigma^{\text{EV}}_k$, which is
+appropriate — real chargers ramp up and down, and per-instance readings
+genuinely can be just below 2 kW even in the "high" state.
+
+**Code.** [`_sample_theta_k()`](../models/graphical_model.py#L1169),
+[`_truncnorm_sample()`](../models/graphical_model.py#L1206).
 
 ### 1.6 $\mu_{\Theta_k}, \sigma_{\Theta_k}, \sigma^{\text{EV}}_k$ — charging-magnitude hyperparameters
 
@@ -326,9 +361,11 @@ recovery regresses (Tier-2 eval, §2.6), the diagnosis is most likely that
 genuine non-EV shape variation does include "evening peak"-like directions
 that overlap with charging signatures.
 
-**Code (planned).** Per-home $\hat\eta^{(n)}$ and the conditional sampler will
-live in a new `_fit_background_hier()` / `_sample_eta()` pair in
-[`graphical_model.py`](../models/graphical_model.py). Not yet implemented.
+**Code.** Per-home $\hat\eta^{(n)}$ and the prior are fit in
+[`_fit_background()`](../models/graphical_model.py#L456) and
+[`_fit_eta_prior()`](../models/graphical_model.py#L542). The conditional
+sampler is [`_sample_eta()`](../models/graphical_model.py#L1224), called as
+block 3 inside [`infer_home()`](../models/graphical_model.py#L781).
 
 ### 2.2 $\bar\eta_t, W, \psi$ — hyperparameters of the $\eta$ prior
 
@@ -360,8 +397,7 @@ small-$N$ regime where regularized estimators (factor analysis with chosen $r$,
 or shrinkage) genuinely beat the empirical sample covariance. Off-the-shelf
 PPCA-EM converges in tens of iterations.
 
-**Code (planned).** New `_fit_eta_prior()` in
-[`graphical_model.py`](../models/graphical_model.py).
+**Code.** [`_fit_eta_prior()`](../models/graphical_model.py#L542).
 
 ### 2.3 $\omega^{(n)}_t$ — Non-EV std-dev profile
 
@@ -447,8 +483,13 @@ variance components, and (c) carrying two $(D,T)$ latent arrays in
 - **Half-Cauchy on $\omega^{(n)}_t$** with a higher-level scale. Common in
   Bayesian hierarchical literature; same non-conjugacy story.
 
-**Code (planned).** New `_sample_omega()` (slice sampler in log-space) in
-[`graphical_model.py`](../models/graphical_model.py).
+**Code.** Slice sampler in log-space:
+[`_sample_omega()`](../models/graphical_model.py#L1273) and the generic
+1-D slice routine [`_slice_sample_1d()`](../models/graphical_model.py#L1333).
+For `omega_mode='global'`, fit-time pooled variance is
+[`_fit_omega_global()`](../models/graphical_model.py#L516); for the
+hierarchical option, prior fit is
+[`_fit_omega_prior()`](../models/graphical_model.py#L622).
 
 ### 2.4 $a^\omega_t, b^\omega_t$ — hyperparameters of the $\omega$ prior
 
@@ -467,8 +508,8 @@ conditional (§2.3).
 Alternative: numerical MLE for the IG (no closed form, easy 1-D root-finding).
 MoM is good enough at this $N$.
 
-**Code (planned).** New `_fit_omega_prior()` in
-[`graphical_model.py`](../models/graphical_model.py).
+**Code.** [`_fit_omega_prior()`](../models/graphical_model.py#L622) (only
+populated when `omega_mode='hierarchical'`).
 
 ### 2.5 Why we keep $x^{\text{EV}}, x^{\text{Non-EV}}$ marginalized at inference
 
@@ -639,12 +680,11 @@ model (see §2.5).
 Per-home Gibbs sampler ([`infer_home()`](../models/graphical_model.py#L490)),
 applied only to homes with $\hat C^{(n)}=1$.
 
-### 4.1 New model — four-block Gibbs
+### 4.1 New model — three-or-four-block Gibbs
 
-Each iteration executes the following blocks in order. Same skeleton as the
-deprecated three-block Gibbs (§4.2), with $\alpha$ replaced by a $T$-dim
-$\eta$ block and a new $\omega$ block; latent components $x^{\text{EV}}, x^{\text{Non-EV}}$
-remain *marginalized throughout* (see §2.5). **Not yet implemented.**
+Each iteration executes the following blocks in order; the $\omega$ block is
+only executed when `omega_mode='hierarchical'` (see §2.3). Latent components
+$x^{\text{EV}}, x^{\text{Non-EV}}$ remain *marginalized throughout* (see §2.5).
 
 1. **FFBS for $z^{(n)}_{d,t}$** (§1.3). Combined-emission likelihood
    $\mathcal{N}(\Theta^{(n)}_k + \eta^{(n)}_t,\ (\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2)$.
@@ -681,7 +721,7 @@ deprecated model; total runtime stays under a few minutes for 9 EV homes.
 
 ### 4.2 Deprecated model — three-block Gibbs
 
-The current code implements this version:
+For historical reference only — removed from code:
 
 - **Initialization.** $\alpha^{(n)} = \mu_\alpha$, $\Theta^{(n)}_k = \mu_{\Theta_k}$,
   $z\equiv\texttt{off}$.
@@ -692,17 +732,17 @@ The current code implements this version:
 
 ### 4.3 Cross-cutting
 
-- **Log-likelihood tracking.** [`_compute_loglik()`](../models/graphical_model.py#L667)
-  for EV homes; [`_compute_loglik_c0()`](../models/graphical_model.py#L681) for
-  non-EV homes (closed-form, no Gibbs). Both will need to be re-derived for
-  the new model.
-- The driver [`infer_all()`](../models/graphical_model.py#L816) iterates over
-  homes; [`c_prob_from_z_via_heuristic()`](../models/graphical_model.py#L877) and
-  [`build_heuristic_homes()`](../models/graphical_model.py#L896) bridge the
-  heuristic detector into the per-home inference pipeline. Unchanged across
-  migration.
+- **Log-likelihood tracking.** [`_compute_loglik()`](../models/graphical_model.py#L1000)
+  for EV homes; [`_compute_loglik_c0()`](../models/graphical_model.py#L1019) for
+  non-EV homes (closed-form, no Gibbs). Both use the marginal combined-variance
+  emission $\mathcal{N}(\Theta_k + \eta_t, \sigma^2_{k,t})$.
+- The driver [`infer_all()`](../models/graphical_model.py#L1394) iterates over
+  homes; [`c_prob_from_z_via_heuristic()`](../models/graphical_model.py#L1659) and
+  [`build_heuristic_homes()`](../models/graphical_model.py#L1669) bridge the
+  heuristic detector into the per-home inference pipeline.
 - **Memory per home.** Dominated by $z$-counts of shape $(D, T, K)$ — under
-  1 MB. New model adds two $(D,T)$ arrays for augmented latents (~0.5 MB).
+  1 MB. No latent $x^{\text{EV}}, x^{\text{Non-EV}}$ arrays are stored
+  (marginalization preserved; see §2.5).
 
 ---
 
@@ -735,23 +775,24 @@ which the Gibbs sampler is compared.
 | Symbol | Kind | Fit | Inference | Code |
 |---|---|---|---|---|
 | $C^{(n)}$ | per-home latent | observed | heuristic | [`first_diff_logistic.predict`](../models/first_diff_logistic.py#L94) |
-| $p_C$ | global scalar | empirical mean | unused | [`fit()`](../models/graphical_model.py#L129) |
-| $z^{(n)}_{d,t}$ | per-home latent | observed | FFBS (block 1) | [`_ffbs()`](../models/graphical_model.py#L702) |
-| $\pi_z, P_z$ | global | smoothed counts | read-only | [`_fit_hmm()`](../models/graphical_model.py#L257) |
-| $\Theta^{(n)}_k$ | per-home latent | observed | Gibbs block 2 | [`_sample_theta_k()`](../models/graphical_model.py#L789) |
-| $\mu_{\Theta_k}, \sigma_{\Theta_k}, \sigma^{\text{EV}}_k$ | global | EM | read-only | [`_fit_charging_em()`](../models/graphical_model.py#L366) |
-| $x^{(n)}_{d,t}$ | observed | observed | observed | [`_build_home_arrays()`](../models/graphical_model.py#L230) |
+| $p_C$ | global scalar | empirical mean | unused | [`fit()`](../models/graphical_model.py#L264) |
+| $z^{(n)}_{d,t}$ | per-home latent | observed | FFBS (block 1) | [`_ffbs()`](../models/graphical_model.py#L1098) |
+| $\pi_z, P_z$ | global | smoothed counts | read-only | [`_fit_hmm()`](../models/graphical_model.py#L417) |
+| $\Theta^{(n)}_k$ | per-home latent (truncated to $B_k$) | observed | Gibbs block 2 (truncated Gaussian) | [`_sample_theta_k()`](../models/graphical_model.py#L1169) |
+| $\mu_{\Theta_k}, \sigma_{\Theta_k}, \sigma^{\text{EV}}_k$ | global | EM | read-only | [`_fit_charging_em()`](../models/graphical_model.py#L665) |
+| $x^{(n)}_{d,t}$ | observed | observed | observed | [`_build_home_arrays()`](../models/graphical_model.py#L391) |
 
-### 6.2 Non-EV side — new model (planned)
+### 6.2 Non-EV side — current model (implemented)
 
-| Symbol | Kind | Fit | Inference | Code (planned) |
+| Symbol | Kind | Fit | Inference | Code |
 |---|---|---|---|---|
-| $\eta^{(n)}_t$ | per-home latent ($T$-vec) | empirical day-mean | Gibbs block 3 ($T$-dim Gaussian, heteroscedastic) | `_sample_eta()` |
-| $\bar\eta_t, W, \psi$ | global ($\Sigma_\eta = WW^\top + \mathrm{diag}(\psi)$) | mean + PPCA with bias-correction | read-only | `_fit_eta_prior()` |
-| $\omega^{(n)}_t$ | per-home latent ($T$-vec) | empirical per-$t$ var | Gibbs block 4 (slice sample, per-$t$) | `_sample_omega()` |
-| $a^\omega_t, b^\omega_t$ | global ($T$-vec each) | method-of-moments | read-only | `_fit_omega_prior()` |
+| $\eta^{(n)}_t$ | per-home latent ($T$-vec) | empirical day-mean | Gibbs block 3 ($T$-dim Gaussian, heteroscedastic) | [`_sample_eta()`](../models/graphical_model.py#L1224) |
+| $\bar\eta_t, W, \psi$ | global ($\Sigma_\eta = WW^\top + \mathrm{diag}(\psi)$) | mean + PPCA with bias-correction | read-only | [`_fit_eta_prior()`](../models/graphical_model.py#L542) |
+| $\sigma^{\text{Non-EV}}_t$ (when `omega_mode='global'`) | global ($T$-vec) | pooled per-$t$ MSE | read-only (fixed) | [`_fit_omega_global()`](../models/graphical_model.py#L516) |
+| $\omega^{(n)}_t$ (when `omega_mode='hierarchical'`) | per-home latent ($T$-vec) | empirical per-$t$ var | Gibbs block 4 (slice sample, per-$t$) | [`_sample_omega()`](../models/graphical_model.py#L1273) |
+| $a^\omega_t, b^\omega_t$ (when `omega_mode='hierarchical'`) | global ($T$-vec each) | method-of-moments | read-only | [`_fit_omega_prior()`](../models/graphical_model.py#L622) |
 
-### 6.3 Non-EV side — deprecated rank-1 (currently in code)
+### 6.3 Non-EV side — deprecated rank-1 (removed from code)
 
 | Symbol | Kind | Fit | Inference | Code |
 |---|---|---|---|---|
