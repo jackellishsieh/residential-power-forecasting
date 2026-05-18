@@ -699,60 +699,75 @@ def _compute_loglik_c0(
 # Gibbs blocks
 # ---------------------------------------------------------------------------
 
+def _hmm_forward(
+    x, theta, alpha, params, log_pi, log_P
+) -> tuple[np.ndarray, float]:
+    """HMM forward pass, vectorized over days.
+
+    Returns (log_f, log_Z1) where:
+      log_f  : (D, T, K) normalised log filter messages
+      log_Z1 : log p(x | C=1, α, θ) = sum of per-step log-normalisation constants
+    """
+    D = x.shape[0]
+    combined_var = params.sigma2_ev[:, None] + params.sigma2_nonev[None, :]   # (K, T)
+    inv_2var     = 0.5 / combined_var
+    log_norm     = -0.5 * np.log(2 * np.pi * combined_var)
+
+    mean_kt  = theta[:, None] + alpha * params.rho[None, :]                   # (K, T)
+    diff     = x[:, :, None] - mean_kt.T[None, :, :]                         # (D, T, K)
+    log_emit = log_norm.T[None, :, :] - diff ** 2 * inv_2var.T[None, :, :]   # (D, T, K)
+
+    log_f  = np.empty((D, T, K), dtype=np.float64)
+    log_Z1 = 0.0
+
+    unnorm_0       = log_pi[None, :] + log_emit[:, 0, :]
+    lse_0          = logsumexp(unnorm_0, axis=1)
+    log_Z1        += lse_0.sum()
+    log_f[:, 0, :] = unnorm_0 - lse_0[:, None]
+
+    for t in range(1, T):
+        log_pred       = logsumexp(log_f[:, t-1, :, None] + log_P[None, :, :], axis=1)
+        unnorm_t       = log_emit[:, t, :] + log_pred
+        lse_t          = logsumexp(unnorm_t, axis=1)
+        log_Z1        += lse_t.sum()
+        log_f[:, t, :] = unnorm_t - lse_t[:, None]
+
+    return log_f, log_Z1
+
+
+def _hmm_backward_sample(log_f: np.ndarray, params: ModelParams, rng) -> np.ndarray:
+    """Backward sampling pass given pre-computed forward messages.
+
+    log_f : (D, T, K) from _hmm_forward
+    Returns z : (D, T) sampled state sequence.
+    """
+    D   = log_f.shape[0]
+    z   = np.empty((D, T), dtype=np.int64)
+    p_T = np.exp(log_f[:, T-1, :])
+    p_T /= p_T.sum(axis=1, keepdims=True)
+    z[:, T-1] = _sample_categorical_rows(p_T, rng)
+
+    P_z = params.P_z
+    for t in range(T - 2, -1, -1):
+        col = P_z[:, z[:, t+1]].T        # (D, K)
+        w   = np.exp(log_f[:, t, :]) * col
+        w  /= w.sum(axis=1, keepdims=True)
+        z[:, t] = _sample_categorical_rows(w, rng)
+
+    return z
+
+
 def _ffbs(
     x, theta, alpha, params, log_pi, log_P, rng
 ) -> tuple[np.ndarray, float]:
     """Forward-filter backward-sample, vectorized over days.
 
     Returns (z, log_Z1) where:
-      z       : (D, T) sampled state sequence
-      log_Z1  : log p(x | C=1, α, θ) — the marginal likelihood under the EV HMM,
-                accumulated as the sum of per-step log-normalisation constants.
-                Used by the mixture sampler to weight C=1 vs C=0.
+      z      : (D, T) sampled state sequence
+      log_Z1 : log p(x | C=1, α, θ) — HMM marginal likelihood from the forward pass
     """
-    D = x.shape[0]
-    rho          = params.rho
-    sigma2_nonev = params.sigma2_nonev
-    sigma2_ev    = params.sigma2_ev
-
-    combined_var = sigma2_ev[:, None] + sigma2_nonev[None, :]     # (K, T)
-    inv_2var     = 0.5 / combined_var
-    log_norm     = -0.5 * np.log(2 * np.pi * combined_var)        # (K, T)
-
-    mean_kt  = theta[:, None] + alpha * rho[None, :]              # (K, T)
-    diff     = x[:, :, None] - mean_kt.T[None, :, :]             # (D, T, K)
-    log_emit = log_norm.T[None, :, :] - diff ** 2 * inv_2var.T[None, :, :]  # (D, T, K)
-
-    # ── forward pass — accumulate log_Z1 ─────────────────────────────────────
-    log_f  = np.empty((D, T, K), dtype=np.float64)
-    log_Z1 = 0.0
-
-    unnorm_0      = log_pi[None, :] + log_emit[:, 0, :]           # (D, K)
-    lse_0         = logsumexp(unnorm_0, axis=1)                   # (D,)
-    log_Z1       += lse_0.sum()
-    log_f[:, 0, :] = unnorm_0 - lse_0[:, None]
-
-    for t in range(1, T):
-        log_pred    = logsumexp(log_f[:, t-1, :, None] + log_P[None, :, :], axis=1)
-        unnorm_t    = log_emit[:, t, :] + log_pred                # (D, K)
-        lse_t       = logsumexp(unnorm_t, axis=1)                 # (D,)
-        log_Z1     += lse_t.sum()
-        log_f[:, t, :] = unnorm_t - lse_t[:, None]
-
-    # ── backward sample ───────────────────────────────────────────────────────
-    z     = np.empty((D, T), dtype=np.int64)
-    p_T   = np.exp(log_f[:, T-1, :])
-    p_T  /= p_T.sum(axis=1, keepdims=True)
-    z[:, T-1] = _sample_categorical_rows(p_T, rng)
-
-    P_z = params.P_z
-    for t in range(T - 2, -1, -1):
-        col = P_z[:, z[:, t+1]].T                                 # (D, K)
-        w   = np.exp(log_f[:, t, :]) * col
-        w  /= w.sum(axis=1, keepdims=True)
-        z[:, t] = _sample_categorical_rows(w, rng)
-
-    return z, log_Z1
+    log_f, log_Z1 = _hmm_forward(x, theta, alpha, params, log_pi, log_P)
+    return _hmm_backward_sample(log_f, params, rng), log_Z1
 
 
 def _sample_categorical_rows(probs: np.ndarray, rng) -> np.ndarray:
@@ -862,6 +877,209 @@ def infer_all(
             rng=rng, home_id=int(hid), verbose=verbose,
             initial_c=init_c, initial_z=init_z,
             c_logistic_model=c_logistic_model,
+        )
+
+    if verbose:
+        print(f"\nAll homes done in {time.time() - t0:.1f}s")
+
+    return results
+
+
+# ===========================================================================
+# Collapsed Gibbs sampler (principled C step)
+# ===========================================================================
+
+def infer_home_collapsed(
+    home_x: np.ndarray,
+    params: ModelParams,
+    *,
+    S_burn: int = 200,
+    S: int = 500,
+    rng: np.random.Generator | None = None,
+    home_id: int = -1,
+    verbose: bool = True,
+    record_traces: bool = True,
+) -> HomeInference:
+    """Collapsed Gibbs inference for one home.  Returns a HomeInference identical in
+    structure to infer_home, so evaluate() works on both without modification.
+
+    Difference from infer_home: C is sampled from its exact marginal posterior each
+    iteration (marginalizing over z via the HMM forward pass), rather than from a
+    logistic heuristic on transition counts.  z is then drawn conditionally on C.
+
+    Gibbs blocks per iteration:
+      1. C  | x, α, Θ  — Bernoulli(p) where
+                          p ∝ p(C=1) · p(x|C=1,α,Θ)  [HMM marginal from fwd pass]
+                          vs p(C=0) · p(x|C=0,α)       [all-off likelihood]
+      2. z  | C, x, α, Θ — backward sample from fwd messages (C=1) or z≡off (C=0)
+      3. Θ_k | z, α, x   — conjugate Gaussian (identical to infer_home)
+      4. α  | z, Θ, x    — conjugate Gaussian (identical to infer_home)
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    D, T_ = home_x.shape
+    assert T_ == T, f"expected T={T}, got {T_}"
+
+    if verbose:
+        print(f"  [home {home_id}] D={D} → "
+              f"collapsed Gibbs ({S_burn} burn-in + {S} retained)")
+
+    # ── initialise ────────────────────────────────────────────────────────────
+    alpha = params.mu_alpha
+    theta = params.mu_theta.copy()
+    z     = np.zeros((D, T), dtype=np.int64)
+    c     = 0
+
+    log_pi = np.log(params.pi_z + 1e-300)
+    log_P  = np.log(params.P_z  + 1e-300)
+
+    # ── storage ───────────────────────────────────────────────────────────────
+    n_total                       = S_burn + S
+    z_counts                      = np.zeros((D, T, K), dtype=np.float64)
+    alpha_samples                 = np.zeros(S,         dtype=np.float64)
+    theta_samples                 = np.zeros((S, K),    dtype=np.float64)
+    c_samples                     = np.zeros(S,         dtype=np.int8)
+    c_from_z_samples              = np.zeros(S,         dtype=np.int8)
+    z_transitions_per_day_samples = np.zeros(S,         dtype=np.float64)
+
+    if record_traces:
+        alpha_trace     = np.zeros(n_total,      dtype=np.float64)
+        theta_trace     = np.zeros((n_total, K), dtype=np.float64)
+        state_occ_trace = np.zeros((n_total, K), dtype=np.float64)
+        loglik_trace    = np.zeros(n_total,      dtype=np.float64)
+    else:
+        alpha_trace = theta_trace = state_occ_trace = loglik_trace = None
+
+    # ── main loop ─────────────────────────────────────────────────────────────
+    t_start = time.time()
+    s_idx   = -1
+
+    for it in range(n_total):
+
+        # Block 1 — C from collapsed posterior ───────────────────────────────
+        log_f, log_Z1 = _hmm_forward(home_x, theta, alpha, params, log_pi, log_P)
+        log_Z0 = _compute_loglik_c0(home_x, alpha, params)
+        log_w1 = np.log(params.p_C + 1e-300) + log_Z1
+        log_w0 = np.log(1 - params.p_C + 1e-300) + log_Z0
+        p_c1   = float(np.exp(log_w1 - float(np.logaddexp(log_w1, log_w0))))
+        c      = int(rng.random() < p_c1)
+
+        # Block 2 — z | C ─────────────────────────────────────────────────────
+        if c == 1:
+            z = _hmm_backward_sample(log_f, params, rng)
+        else:
+            z = np.zeros((D, T), dtype=np.int64)
+
+        # Block 3 — Θ_k ───────────────────────────────────────────────────────
+        for k in (1, 2):
+            theta[k] = _sample_theta_k(home_x, z, alpha, params, k, rng)
+
+        # Block 4 — α ─────────────────────────────────────────────────────────
+        alpha = _sample_alpha(home_x, z, theta, params, rng)
+
+        # ── record ────────────────────────────────────────────────────────────
+        if record_traces:
+            alpha_trace[it]     = alpha
+            theta_trace[it]     = theta
+            state_occ_trace[it] = [(z == k).mean() for k in range(K)]
+            loglik_trace[it]    = _compute_loglik(home_x, z, theta, alpha, params)
+
+        if it >= S_burn:
+            s_idx = it - S_burn
+            alpha_samples[s_idx] = alpha
+            theta_samples[s_idx] = theta
+            c_samples[s_idx]     = c
+            for k in range(K):
+                z_counts[:, :, k] += (z == k)
+            c_from_z_samples[s_idx]              = int(np.any(z != 0))
+            z_transitions_per_day_samples[s_idx] = float(
+                (np.diff(z, axis=1) != 0).sum() / D
+            )
+
+        if verbose and (it < 3 or it == S_burn or (it + 1) % 100 == 0):
+            phase   = "burn-in" if it < S_burn else "keep  "
+            elapsed = time.time() - t_start
+            conv_flag = ""
+            if s_idx >= 50:
+                window    = alpha_samples[max(0, s_idx - 49): s_idx + 1]
+                conv_flag = f"  Δα/σ={abs(window[-1]-window[0])/(window.std()+1e-9)*100:.0f}%"
+            ll = loglik_trace[it] if record_traces else float("nan")
+            print(f"    iter {it+1:4d}/{n_total} [{phase}]  "
+                  f"C={c}  α={alpha:.3f}  Θ_low={theta[1]:.3f}  Θ_high={theta[2]:.3f}  "
+                  f"logL={ll:.1f}  ({elapsed:.1f}s){conv_flag}")
+
+    # ── summaries ─────────────────────────────────────────────────────────────
+    z_marginals = z_counts / S
+    z_hat       = np.argmax(z_marginals, axis=2)
+    c_hat_prob  = float(c_samples.mean())
+
+    if verbose:
+        elapsed = time.time() - t_start
+        frac = z_marginals.mean(axis=(0, 1))
+        print(f"\n  [home {home_id}] done in {elapsed:.1f}s")
+        print(f"    P̂(C=1) from chain : {c_hat_prob:.4f}  (hard={int(c_hat_prob >= 0.5)})")
+        print(f"    z freq : off={frac[0]:.3f}  low={frac[1]:.3f}  high={frac[2]:.3f}")
+        print(f"    α : mean={alpha_samples.mean():.3f}  std={alpha_samples.std():.4f}")
+        for k in (1, 2):
+            print(f"    Θ[{STATE_NAMES[k]:>4}] : "
+                  f"mean={theta_samples[:,k].mean():.3f}  std={theta_samples[:,k].std():.4f}")
+
+    return HomeInference(
+        home_id                       = home_id,
+        C_hat                         = int(c_hat_prob >= 0.5),
+        z_hat                         = z_hat,
+        z_marginals                   = z_marginals,
+        alpha_samples                 = alpha_samples,
+        theta_samples                 = theta_samples,
+        c_samples                     = c_samples,
+        c_from_z_samples              = c_from_z_samples,
+        z_transitions_per_day_samples = z_transitions_per_day_samples,
+        alpha_trace                   = alpha_trace,
+        theta_trace                   = theta_trace,
+        state_occ_trace               = state_occ_trace,
+        loglik_trace                  = loglik_trace,
+        S_burn                        = S_burn,
+    )
+
+
+def infer_all_collapsed(
+    df: pd.DataFrame,
+    params: ModelParams,
+    *,
+    S_burn: int = 200,
+    S: int = 500,
+    seed: int = 0,
+    verbose: bool = True,
+) -> dict[int, HomeInference]:
+    """Run infer_home_collapsed on every home in df.
+
+    Drop-in replacement for infer_all; result dict is compatible with evaluate().
+    """
+    if verbose:
+        print("=" * 60)
+        print("INFERENCE: collapsed Gibbs over all homes")
+        print("=" * 60)
+
+    sorted_df = df.sort_values(["home_id", "day", "time_index"])
+    homes     = list(sorted_df["home_id"].unique())
+    rng       = np.random.default_rng(seed)
+
+    results: dict[int, HomeInference] = {}
+    t0 = time.time()
+    for i, hid in enumerate(homes):
+        g = sorted_df[sorted_df["home_id"] == hid]
+        D = len(g) // T
+        x = g["total_load"].to_numpy().reshape(D, T).astype(np.float64)
+
+        if verbose:
+            true_c = int(g["has_ev"].iloc[0]) if "has_ev" in g.columns else "?"
+            print(f"\n[{i+1}/{len(homes)}] home {hid}  D={D}  true_c={true_c}")
+
+        results[int(hid)] = infer_home_collapsed(
+            x, params,
+            S_burn=S_burn, S=S,
+            rng=rng, home_id=int(hid), verbose=verbose,
         )
 
     if verbose:
