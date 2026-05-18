@@ -3,36 +3,56 @@ Generative graphical model for residential power: fit + Gibbs inference.
 
 Notation and derivations follow specs/model.md. Briefly:
 
-  Per-home/day/timestep emission (new hierarchical Non-EV submodel):
+  Per-home/day/timestep emission:
 
       x^(n)_{d,t} | z^(n)_{d,t}=k  ~  N( Theta^(n)_k + eta^(n)_t,
-                                          (sigma^EV_k)^2 + (omega^(n)_t)^2 )
+                                          (sigma^EV_k)^2 + omega^2_t(n,...) )
 
-  with hierarchical priors across homes on (eta, omega):
+  with a hierarchical prior across homes on the per-home Non-EV mean
+  profile eta^(n) ∈ R^T:
 
       eta^(n)              ~ N( eta_bar, Sigma_eta = W W^T + diag(psi) )   (PPCA / FA)
-      (omega^(n)_t)^2      ~ InvGamma( a_omega_t, b_omega_t ),   independent per t
 
-  At fit time, x_EV and x_Non-EV are observed separately and per-home
+  and *one of two* parameterizations for the Non-EV variance profile,
+  controlled by `omega_mode` in ModelParams:
+
+      omega_mode = "global"        (DEFAULT, recommended for stability)
+          omega^2_t = sigma2_nev_global[t]  is a GLOBAL T-vector fit from
+          training data and held FIXED at inference. No Gibbs block.
+
+      omega_mode = "hierarchical"
+          (omega^(n)_t)^2 ~ InvGamma(a_omega_t, b_omega_t)   per t, per home.
+          Sampled at inference via a univariate slice sampler in log-variance.
+
+  At fit time, x_EV and x_Non-EV are observed separately. Per-home
   (eta_hat, omega_hat) are read off as empirical day-mean and within-home
-  variance; the hyperparameters (eta_bar, W, psi, a_omega, b_omega) are then
-  fit across homes.
+  variance, then used to fit the cross-home hyperparameters.
 
   At inference, the latent decomposition x = x_EV + x_Non-EV is *never*
-  sampled. The Gibbs sampler operates on the marginal combined-variance
-  likelihood (see specs/model.md §2.5). Four blocks per iter:
+  sampled — the Gibbs sampler operates on the marginal combined-variance
+  likelihood (see specs/model.md §2.5). Blocks per iter:
 
       1. z  via FFBS                       (HMM forward filter + backward sample)
       2. Theta_k for k in {low, high}      (conjugate Gaussian; heteroscedastic in z,t)
       3. eta                               (T-dim conjugate Gaussian under PPCA prior)
-      4. omega_t for t = 0..T-1            (univariate slice sampler in log-variance)
+      4. omega_t (only if omega_mode == "hierarchical"; otherwise omitted)
 
-  Plus the mixture-Gibbs C step that decides z=all-off vs z from FFBS,
-  and the heuristic-logistic resample of C from per-day z-transition rate
-  (both preserved from the previous design).
+  Plus the mixture-Gibbs C step (z = FFBS candidate vs z = all-off) and the
+  heuristic-logistic resample of C from per-day z-transition rate.
 
 The deprecated rank-1 background submodel (alpha, rho, mu_alpha, sigma_alpha,
 sigma_nonev) has been removed. See specs/model.md §2.7 for what it was.
+
+Swapping in different Non-EV parameterizations:
+
+  All dispatch happens in three places, marked with `# DISPATCH:` comments:
+    - `_fit_background()`           — fit-time dispatch on omega_mode
+    - `infer_home()` initialization — choose initial omega^2
+    - `infer_home()` main loop      — whether to run the omega Gibbs block
+  Adding a new omega parameterization means handling these three places and
+  adding a new branch in the ModelParams summary. The mean side currently
+  has only one parameterization (hierarchical PPCA on eta); same pattern
+  would apply if we wanted a swap.
 """
 
 from __future__ import annotations
@@ -87,6 +107,12 @@ class ModelParams:
 
       Sigma_eta = W_eta W_eta.T + diag(psi_eta)  is the PPCA / factor-analyzer
       prior covariance for the per-home Non-EV mean profile eta^(n) (T-vec).
+
+      omega_mode selects how the Non-EV variance profile is parameterized:
+        "global"       : sigma2_nev_global is a fixed T-vector. No inference-time
+                          Gibbs block. (DEFAULT; recommended.)
+        "hierarchical" : (omega^(n)_t)^2 ~ InvGamma(a_omega_t, b_omega_t).
+                          Sampled at inference via slice sampler.
     """
 
     # EV state
@@ -104,12 +130,24 @@ class ModelParams:
     W_eta:   np.ndarray         # (T, r) PPCA loading matrix
     psi_eta: np.ndarray         # (T,) per-t residual variance
 
-    # Non-EV: hierarchical prior on per-home variance profile (omega^(n)_t)^2
-    a_omega: np.ndarray         # (T,) InvGamma shape, per t
-    b_omega: np.ndarray         # (T,) InvGamma rate,  per t
+    # Non-EV variance: one of two parameterizations (see class docstring).
+    omega_mode: str = "global"                         # "global" | "hierarchical"
+    sigma2_nev_global: np.ndarray | None = None        # (T,) — used iff omega_mode == "global"
+    a_omega: np.ndarray | None = None                  # (T,) — used iff omega_mode == "hierarchical"
+    b_omega: np.ndarray | None = None                  # (T,) — used iff omega_mode == "hierarchical"
 
     K: int = K
     T: int = T
+
+    def __post_init__(self):
+        if self.omega_mode == "global":
+            if self.sigma2_nev_global is None:
+                raise ValueError("omega_mode='global' requires sigma2_nev_global")
+        elif self.omega_mode == "hierarchical":
+            if self.a_omega is None or self.b_omega is None:
+                raise ValueError("omega_mode='hierarchical' requires a_omega and b_omega")
+        else:
+            raise ValueError(f"unknown omega_mode={self.omega_mode!r}")
 
     @property
     def ppca_rank(self) -> int:
@@ -119,9 +157,16 @@ class ModelParams:
         """Materialize the full T×T prior covariance (for inspection only)."""
         return self.W_eta @ self.W_eta.T + np.diag(self.psi_eta)
 
+    def expected_omega2(self) -> np.ndarray:
+        """The "best single estimate" of (omega_t)^2 per t under the current
+        parameterization. For omega_mode='global', returns sigma2_nev_global;
+        for 'hierarchical', returns IG prior mean b/(a-1). Shape (T,)."""
+        if self.omega_mode == "global":
+            return self.sigma2_nev_global
+        return self.b_omega / np.maximum(self.a_omega - 1.0, 1e-12)
+
     def summary(self) -> str:
         r = self.ppca_rank
-        omega_prior_mean = self.b_omega / np.maximum(self.a_omega - 1.0, 1e-12)  # IG mean
         lines = [
             "ModelParams summary",
             "-" * 40,
@@ -153,15 +198,27 @@ class ModelParams:
             f"max={self.psi_eta.max():.4f})",
         ]
 
-        lines.append("\nNon-EV — hierarchical omega prior (InvGamma per t)")
-        lines += [
-            f"  a_omega             (shape: min={self.a_omega.min():.2f}, "
-            f"median={np.median(self.a_omega):.2f}, max={self.a_omega.max():.2f})",
-            f"  b_omega             (rate:  min={self.b_omega.min():.4f}, "
-            f"median={np.median(self.b_omega):.4f}, max={self.b_omega.max():.4f})",
-            f"  E[(omega_t)^2]      (prior mean: min={omega_prior_mean.min():.4f}, "
-            f"median={np.median(omega_prior_mean):.4f}, max={omega_prior_mean.max():.4f})",
-        ]
+        lines.append(f"\nNon-EV — omega parameterization: {self.omega_mode!r}")
+        if self.omega_mode == "global":
+            sig_g = np.sqrt(self.sigma2_nev_global)
+            lines += [
+                f"  sigma2_nev_global   (fixed at inference; per-t std-dev: "
+                f"min={sig_g.min():.3f}, median={np.median(sig_g):.3f}, "
+                f"max={sig_g.max():.3f})",
+            ]
+        else:
+            prior_mean = self.b_omega / np.maximum(self.a_omega - 1.0, 1e-12)
+            lines += [
+                f"  a_omega             (IG shape: min={self.a_omega.min():.2f}, "
+                f"median={np.median(self.a_omega):.2f}, "
+                f"max={self.a_omega.max():.2f})",
+                f"  b_omega             (IG rate:  min={self.b_omega.min():.4f}, "
+                f"median={np.median(self.b_omega):.4f}, "
+                f"max={self.b_omega.max():.4f})",
+                f"  E[(omega_t)^2]      (prior mean: min={prior_mean.min():.4f}, "
+                f"median={np.median(prior_mean):.4f}, "
+                f"max={prior_mean.max():.4f})",
+            ]
         return "\n".join(lines)
 
 
@@ -204,6 +261,7 @@ def fit(
     train_df: pd.DataFrame,
     *,
     ppca_rank: int = PPCA_RANK_DEFAULT,
+    omega_mode: str = "global",
     verbose: bool = True,
 ) -> ModelParams:
     """Fit all global parameters from a fully-labeled training dataframe.
@@ -211,8 +269,15 @@ def fit(
     Required columns: home_id, day, time_index, total_load, ev_load,
                       non_ev_load, charge_state, has_ev.
 
-    ppca_rank : rank r for the PPCA prior covariance of eta^(n).
-                r=0 corresponds to a plain diagonal prior diag(psi).
+    ppca_rank  : rank r for the PPCA prior covariance of eta^(n).
+                 r=0 corresponds to a plain diagonal prior diag(psi).
+    omega_mode : Non-EV variance parameterization.
+                 "global"       — fit a single T-vector sigma2_nev_global across
+                                  homes; FIXED at inference. (DEFAULT.)
+                 "hierarchical" — per-home (omega^(n)_t)^2 with IG prior;
+                                  sampled at inference. More flexible but can
+                                  trigger a "ω shrinks → z over-fires" feedback
+                                  loop in some regimes.
     """
     if verbose:
         print("=" * 60)
@@ -274,10 +339,11 @@ def fit(
     # ------------------------------------------------------------------
     t0 = time.time()
     if verbose:
-        print(f"\n[Step 3] Hierarchical Non-EV submodel from all {N} homes "
-              f"(PPCA rank r={ppca_rank})")
-    eta_bar, W_eta, psi_eta, a_omega, b_omega = _fit_background_hier(
-        home_arrays, list(homes), ppca_rank=ppca_rank, verbose=verbose,
+        print(f"\n[Step 3] Non-EV submodel from all {N} homes  "
+              f"(PPCA rank r={ppca_rank}, omega_mode={omega_mode!r})")
+    eta_bar, W_eta, psi_eta, sigma2_nev_global, a_omega, b_omega = _fit_background(
+        home_arrays, list(homes),
+        ppca_rank=ppca_rank, omega_mode=omega_mode, verbose=verbose,
     )
     if verbose:
         print(f"  Step 3 done in {time.time() - t0:.3f}s")
@@ -299,6 +365,8 @@ def fit(
         eta_bar=eta_bar,
         W_eta=W_eta,
         psi_eta=psi_eta,
+        omega_mode=omega_mode,
+        sigma2_nev_global=sigma2_nev_global,
         a_omega=a_omega,
         b_omega=b_omega,
         mu_theta=mu_theta,
@@ -381,40 +449,36 @@ def _fit_hmm(home_arrays: dict, ev_homes: list[int], *, verbose: bool):
 # Step 3 — Hierarchical Non-EV submodel (NEW)
 # ---------------------------------------------------------------------------
 
-def _fit_background_hier(
+def _fit_background(
     home_arrays: dict,
     homes: list[int],
     *,
     ppca_rank: int,
+    omega_mode: str,
     verbose: bool,
 ):
-    """Fit hierarchical priors for eta^(n) and (omega^(n))^2 from labeled data.
+    """Fit the Non-EV submodel from labeled training data.
+
+    DISPATCH: omega_mode selects the variance parameterization
+        "global"        → returns (sigma2_nev_global, a_omega=None, b_omega=None)
+        "hierarchical"  → returns (sigma2_nev_global=None, a_omega, b_omega)
+
+    Mean side (eta) is hierarchical PPCA in both cases.
 
     Returns
     -------
-    eta_bar : (T,)   global mean profile
-    W_eta   : (T, r) PPCA loading matrix (r = ppca_rank)
-    psi_eta : (T,)   per-t residual variance
-    a_omega : (T,)   InvGamma shape parameters
-    b_omega : (T,)   InvGamma rate  parameters
-
-    Procedure:
-      1. Per-home empirical mean profile eta_hat^(n)_t and variance
-         (omega_hat^(n)_t)^2 over days.
-      2. Fit eta-prior across homes: eta_bar = mean, then bias-corrected
-         PPCA on the centered eta_hat^(n).
-      3. Fit omega-prior across homes: method-of-moments on the per-home
-         (omega_hat)^2 values, per t.
+    eta_bar           : (T,)   global mean profile
+    W_eta             : (T, r) PPCA loading matrix
+    psi_eta           : (T,)   per-t residual variance
+    sigma2_nev_global : (T,) or None
+    a_omega           : (T,) or None
+    b_omega           : (T,) or None
     """
-    N = len(homes)
-
     # --- 3a. per-home plug-in eta_hat and (omega_hat)^2 ---------------
-    eta_hat   = np.stack([home_arrays[hid]["x_nev"].mean(axis=0) for hid in homes])  # (N, T)
-    # ddof=0 = MLE form; we apply a degree-of-freedom correction in the bias
-    # subtraction below where needed.
+    eta_hat   = np.stack([home_arrays[hid]["x_nev"].mean(axis=0) for hid in homes])
     omega2_hat = np.stack([home_arrays[hid]["x_nev"].var(axis=0, ddof=0)
-                           for hid in homes])                                         # (N, T)
-    Ds = np.array([home_arrays[hid]["D"] for hid in homes], dtype=np.float64)         # (N,)
+                           for hid in homes])
+    Ds = np.array([home_arrays[hid]["D"] for hid in homes], dtype=np.float64)
 
     if verbose:
         print(f"  Per-home plug-ins:")
@@ -426,15 +490,49 @@ def _fit_background_hier(
               f"min={sig_hat.min():.3f}, median={np.median(sig_hat):.3f}, "
               f"max={sig_hat.max():.3f}")
 
-    # --- 3b. eta-prior fit --------------------------------------------
+    # --- 3b. eta-prior fit (hierarchical PPCA — always) ---------------
     eta_bar, W_eta, psi_eta = _fit_eta_prior(
         eta_hat, omega2_hat, Ds, ppca_rank=ppca_rank, verbose=verbose,
     )
 
-    # --- 3c. omega-prior fit ------------------------------------------
-    a_omega, b_omega = _fit_omega_prior(omega2_hat, verbose=verbose)
+    # --- 3c. omega parameterization (DISPATCH on omega_mode) ----------
+    if omega_mode == "global":
+        sigma2_nev_global = _fit_omega_global(omega2_hat, Ds, verbose=verbose)
+        a_omega = b_omega = None
+    elif omega_mode == "hierarchical":
+        a_omega, b_omega = _fit_omega_prior(omega2_hat, verbose=verbose)
+        sigma2_nev_global = None
+    else:
+        raise ValueError(f"unknown omega_mode={omega_mode!r}; "
+                         f"expected 'global' or 'hierarchical'")
 
-    return eta_bar, W_eta, psi_eta, a_omega, b_omega
+    return eta_bar, W_eta, psi_eta, sigma2_nev_global, a_omega, b_omega
+
+
+def _fit_omega_global(
+    omega2_hat: np.ndarray,    # (N, T)  per-home empirical day-variance
+    Ds: np.ndarray,            # (N,)    per-home day counts
+    *,
+    verbose: bool,
+) -> np.ndarray:
+    """Global per-t Non-EV variance, weighted by per-home day counts.
+
+    sigma2_nev_global[t] = (sum_n D^(n) * omega_hat^(n)_t^2) / (sum_n D^(n))
+
+    This is the same pooled estimator that the deprecated rank-1 model used
+    (specs/model.md §2.7.4), with eta_hat^(n) as the per-home mean estimator
+    instead of alpha^(n)*rho_t. Held FIXED at inference (no Gibbs block).
+    """
+    weights = Ds / Ds.sum()                                # (N,)
+    sigma2 = (weights[:, None] * omega2_hat).sum(axis=0)   # (T,)
+
+    if verbose:
+        sig = np.sqrt(sigma2)
+        print(f"  Omega-fit (global, fixed at inference):")
+        print(f"    sigma_nev_global_t (std-dev): "
+              f"min={sig.min():.3f}, median={np.median(sig):.3f}, "
+              f"max={sig.max():.3f}")
+    return sigma2
 
 
 def _fit_eta_prior(
@@ -727,9 +825,17 @@ def infer_home(
     # ── initial state ─────────────────────────────────────────────────────────
     theta  = params.mu_theta.copy()
     eta    = params.eta_bar.copy()
-    # InvGamma mode = b / (a + 1) (mean = b/(a-1); we pick the mode for slight
-    # robustness when a is small; both are reasonable)
-    omega2 = (params.b_omega / (params.a_omega + 1.0)).copy()
+
+    # DISPATCH: initial omega^2 depends on the variance parameterization
+    if params.omega_mode == "global":
+        # Fixed across all iterations; the omega Gibbs block is omitted below
+        omega2 = params.sigma2_nev_global.copy()
+    elif params.omega_mode == "hierarchical":
+        # IG mode (slightly more conservative than the mean when a is small)
+        omega2 = (params.b_omega / (params.a_omega + 1.0)).copy()
+    else:
+        raise ValueError(f"unknown omega_mode={params.omega_mode!r}")
+
     z      = initial_z.copy() if initial_z is not None else np.zeros((D, T), dtype=np.int64)
     c      = initial_c
 
@@ -791,9 +897,14 @@ def infer_home(
         eta = _sample_eta(home_x, z, theta, omega2, params,
                           Sigma_eta_inv, Sigma_eta_inv_etabar, rng)
 
-        # --- 4. omega^2 (slice sample per t) --------------------------------
-        omega2, evals_this_iter = _sample_omega(home_x, z, theta, eta, omega2, params, rng)
-        n_slice_evals += evals_this_iter
+        # --- 4. omega^2 ----------------------------------------------------
+        # DISPATCH: only sample omega when the parameterization makes it a
+        # latent. In "global" mode, omega2 is fixed at sigma2_nev_global.
+        if params.omega_mode == "hierarchical":
+            omega2, evals_this_iter = _sample_omega(
+                home_x, z, theta, eta, omega2, params, rng,
+            )
+            n_slice_evals += evals_this_iter
 
         # --- traces ---------------------------------------------------------
         if record_traces:
@@ -822,12 +933,15 @@ def infer_home(
             phase = "burn-in" if it < S_burn else "keep  "
             elapsed = time.time() - t_start
             ll = loglik_trace[it] if record_traces else float("nan")
-            slice_per_iter = n_slice_evals / max(it + 1, 1)
+            slice_tag = (
+                f", slice~{n_slice_evals / max(it+1,1):.1f}eval/it"
+                if params.omega_mode == "hierarchical" else ""
+            )
             print(f"    iter {it+1:4d}/{n_total} [{phase}]  "
                   f"C={c}  Θ_low={theta[1]:.3f}  Θ_high={theta[2]:.3f}  "
                   f"η∈[{eta.min():+.2f},{eta.max():+.2f}]  "
                   f"σω∈[{np.sqrt(omega2.min()):.3f},{np.sqrt(omega2.max()):.3f}]  "
-                  f"logL={ll:.1f}  ({elapsed:.1f}s, slice~{slice_per_iter:.1f}eval/it)")
+                  f"logL={ll:.1f}  ({elapsed:.1f}s{slice_tag})")
 
     # ── final summaries ───────────────────────────────────────────────────────
     z_marginals = z_counts / S
@@ -837,9 +951,12 @@ def infer_home(
     if verbose:
         elapsed = time.time() - t_start
         frac = z_marginals.mean(axis=(0, 1))
-        print(f"\n  [home {home_id}] done in {elapsed:.1f}s  "
-              f"(total slice evals = {n_slice_evals}, "
-              f"avg {n_slice_evals/n_total:.1f}/iter across T={T})")
+        slice_tag = (
+            f"  (total slice evals = {n_slice_evals}, "
+            f"avg {n_slice_evals/n_total:.1f}/iter across T={T})"
+            if params.omega_mode == "hierarchical" else ""
+        )
+        print(f"\n  [home {home_id}] done in {elapsed:.1f}s{slice_tag}")
         print(f"    P̂(C=1) from chain : {c_hat_prob:.4f}  (hard={int(c_hat_prob >= 0.5)})")
         print(f"    z freq : off={frac[0]:.3f}  low={frac[1]:.3f}  high={frac[2]:.3f}")
         eta_post_mean    = eta_samples.mean(axis=0)
