@@ -180,28 +180,59 @@ this household charge differently?" — that we don't currently care about).
 
 ### 1.5 $\Theta^{(n)}_k$ — per-home mean charging power in state $k$
 
-**Distribution.** $\Theta^{(n)}_k \stackrel{\text{iid}}{\sim} \mathcal{N}(\mu_{\Theta_k}, \sigma_{\Theta_k}^2)$
-for $k\in\{\texttt{low},\texttt{high}\}$, with the off-state pinned:
-$\Theta^{(n)}_{\texttt{off}}=0$, $\sigma_{\Theta_{\texttt{off}}}=0$.
+**Distribution.** $\Theta^{(n)}_k \stackrel{\text{iid}}{\sim} \mathcal{N}(\mu_{\Theta_k}, \sigma_{\Theta_k}^2) \cdot \mathbf{1}[\Theta^{(n)}_k \in B_k]$
+for $k\in\{\texttt{low},\texttt{high}\}$, i.e. a **truncated normal** with
+state-specific magnitude bounds
+
+$$B_{\texttt{low}} = [0.1,\ 2]\ \text{kW},\qquad B_{\texttt{high}} = [2,\ \infty)\ \text{kW}.$$
+
+The off-state is pinned: $\Theta^{(n)}_{\texttt{off}}=0$,
+$\sigma_{\Theta_{\texttt{off}}}=0$. The bounds encode the **definitional**
+semantics of "low" vs. "high" charging (the same cutoffs used to label states
+in the training data) directly into the prior — without them, an unconstrained
+$\mathcal{N}$ prior makes the two states statistically indistinguishable apart
+from the fitted hyperparameters, which is fragile at inference when the data
+is ambiguous. The bounds live in `THETA_BOUNDS` in
+[`graphical_model.py`](../models/graphical_model.py).
 
 **Fit.** Observed in training (since $z$ and $x^{\text{EV}}$ are both labeled,
 per-home means $\hat\theta^{(n)}_k = S_y^{(n)} / n^{(n)}_k$ are sufficient
 stats). The *hyperparameters* $\mu_{\Theta_k},\sigma_{\Theta_k}^2,\sigma^{\text{EV}}_k$
-are jointly fit by short EM — see §1.6.
+are jointly fit by short EM — see §1.6. The truncation is not modeled in EM
+(we treat $(\mu_{\Theta_k},\sigma_{\Theta_k}^2)$ as the parameters of the
+*underlying* untruncated Normal). Since labeled $\hat\theta^{(n)}_k$ values
+lie inside $B_k$ by construction of the labels, the bias from omitting the
+truncation normalizer in the M-step is small; verbose mode prints the
+fraction of *prior* probability mass inside $B_k$ as a sanity check.
 
-**Inference.** Gibbs block 2 (after FFBS) inside
-[`infer_home()`](../models/graphical_model.py#L781) and
-[`infer_home_collapsed()`](../models/graphical_model.py#L1413).
-Conditional on current $z, \eta, \omega$, observations in state $k$ are
+**Inference.** Gibbs block 2 inside [`infer_home()`](../models/graphical_model.py#L781).
+Conditional on current $z,\eta,\omega$, observations in state $k$ are
 Gaussian with known mean offset and known per-time variance, giving a
-Gaussian-prior × Gaussian-likelihood update with closed-form posterior:
+truncated-Gaussian-prior × Gaussian-likelihood update. The indicator
+$\mathbf{1}[\Theta^{(n)}_k \in B_k]$ passes through the Gaussian conjugacy
+unchanged: the posterior is the *same* untruncated-conjugate Normal, truncated
+to $B_k$:
 
-$$\Theta^{(n)}_k \sim \mathcal{N}(m_k,\, 1/\text{prec}_k),\quad \text{prec}_k = \tfrac{1}{\sigma_{\Theta_k}^2} + \sum_{(d,t)\in\mathcal{T}_k}\tfrac{1}{\sigma^2_{k,t}}.$$
+$$\Theta^{(n)}_k \sim \mathcal{N}(m_k,\, 1/\text{prec}_k) \cdot \mathbf{1}[\Theta^{(n)}_k \in B_k],\quad \text{prec}_k = \tfrac{1}{\sigma_{\Theta_k}^2} + \sum_{(d,t)\in\mathcal{T}_k}\tfrac{1}{\sigma^2_{k,t}}.$$
 
+Sampled via `scipy.stats.truncnorm.rvs` ($O(1)$ per draw, inverse-CDF based).
 If $|\mathcal{T}_k|=0$ (no observations assigned to state $k$ in the current
-$z$), draw from the prior.
+$z$), draw from the truncated prior.
 
-**Code.** [`_sample_theta_k()`](../models/graphical_model.py#L1133).
+**Why truncate the prior, not the emission?** Truncating the emission
+$x^{\text{EV}}_t | z_t{=}k$ would break FFBS marginalization: the convolution
+of a truncated $x^{\text{EV}}$ with Gaussian $x^{\text{Non-EV}}$ has no
+closed form, so the per-cell emission likelihood used by the HMM forward
+pass would need quadrature or moment-matching. Truncating only the per-home
+*mean* $\Theta^{(n)}_k$ leaves the conditional structure of every Gibbs block
+intact and addresses the most likely failure mode (the per-home mean drifting
+out of its semantic band under ambiguous data at inference). Individual
+emissions can still fall outside $B_k$ via $\sigma^{\text{EV}}_k$, which is
+appropriate — real chargers ramp up and down, and per-instance readings
+genuinely can be just below 2 kW even in the "high" state.
+
+**Code.** [`_sample_theta_k()`](../models/graphical_model.py#L1169),
+[`_truncnorm_sample()`](../models/graphical_model.py#L1206).
 
 ### 1.6 $\mu_{\Theta_k}, \sigma_{\Theta_k}, \sigma^{\text{EV}}_k$ — charging-magnitude hyperparameters
 
@@ -784,7 +815,7 @@ which the Gibbs sampler is compared.
 | $p_C$ | global scalar | empirical mean | read-only | [`fit()`](../models/graphical_model.py#L264) |
 | $z^{(n)}_{d,t}$ | per-home latent | observed | FFBS (block 1) | [`_ffbs()`](../models/graphical_model.py#L1108) |
 | $\pi_z, P_z$ | global | smoothed counts | read-only | [`_fit_hmm()`](../models/graphical_model.py#L417) |
-| $\Theta^{(n)}_k$ | per-home latent | observed | Gibbs block 2 | [`_sample_theta_k()`](../models/graphical_model.py#L1133) |
+| $\Theta^{(n)}_k$ | per-home latent (truncated to $B_k$) | observed | Gibbs block 2 (truncated Gaussian) | [`_sample_theta_k()`](../models/graphical_model.py#L1169) |
 | $\mu_{\Theta_k}, \sigma_{\Theta_k}, \sigma^{\text{EV}}_k$ | global | EM | read-only | [`_fit_charging_em()`](../models/graphical_model.py#L665) |
 | $x^{(n)}_{d,t}$ | observed | observed | observed | [`_build_home_arrays()`](../models/graphical_model.py#L391) |
 
