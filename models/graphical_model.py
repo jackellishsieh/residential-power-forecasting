@@ -1428,13 +1428,15 @@ def infer_home_collapsed(
     iteration (marginalizing over z via the HMM forward pass), rather than from a
     logistic heuristic on transition counts.  z is then drawn conditionally on C.
 
-    Gibbs blocks per iteration:
-      1. C  | x, α, Θ  — Bernoulli(p) where
-                          p ∝ p(C=1) · p(x|C=1,α,Θ)  [HMM marginal from fwd pass]
-                          vs p(C=0) · p(x|C=0,α)       [all-off likelihood]
-      2. z  | C, x, α, Θ — backward sample from fwd messages (C=1) or z≡off (C=0)
-      3. Θ_k | z, α, x   — conjugate Gaussian (identical to infer_home)
-      4. α  | z, Θ, x    — conjugate Gaussian (identical to infer_home)
+    Gibbs blocks per iteration (hierarchical Non-EV submodel):
+      1. C  | x, Θ, η, ω  — Bernoulli(p) where
+                            p ∝ p(C=1) · p(x|C=1,Θ,η,ω)  [HMM marginal from fwd pass]
+                            vs p(C=0) · p(x|C=0,η,ω)       [all-off likelihood]
+      2. z  | C, x, Θ, η, ω — backward sample from fwd messages (C=1) or z≡off (C=0)
+      3. Θ_k | z, η, ω, x   — conjugate Gaussian (identical to infer_home)
+      4. η   | z, Θ, ω, x   — T-dim conjugate Gaussian under PPCA prior
+      5. ω^2 | z, Θ, η, x   — slice sample per t  (only if omega_mode='hierarchical';
+                              skipped in 'global' mode)
     """
     if rng is None:
         rng = np.random.default_rng(0)
