@@ -119,6 +119,10 @@ class HomeInference:
     state_occ_trace: np.ndarray | None = None    # (S_burn + S, K) fraction in each state
     loglik_trace: np.ndarray | None = None       # (S_burn + S,) complete-data log-likelihood
 
+    # Collapsed Gibbs only: marginal likelihood traces
+    log_Z1_trace: np.ndarray | None = None       # (S_burn + S,) log p(x | C=1, α, Θ)
+    log_Z0_trace: np.ndarray | None = None       # (S_burn + S,) log p(x | C=0, α)
+
     S_burn: int = 0                              # number of burn-in iterations
 
 
@@ -948,8 +952,11 @@ def infer_home_collapsed(
         theta_trace     = np.zeros((n_total, K), dtype=np.float64)
         state_occ_trace = np.zeros((n_total, K), dtype=np.float64)
         loglik_trace    = np.zeros(n_total,      dtype=np.float64)
+        log_Z1_trace    = np.zeros(n_total,      dtype=np.float64)
+        log_Z0_trace    = np.zeros(n_total,      dtype=np.float64)
     else:
         alpha_trace = theta_trace = state_occ_trace = loglik_trace = None
+        log_Z1_trace = log_Z0_trace = None
 
     # ── main loop ─────────────────────────────────────────────────────────────
     t_start = time.time()
@@ -984,6 +991,8 @@ def infer_home_collapsed(
             theta_trace[it]     = theta
             state_occ_trace[it] = [(z == k).mean() for k in range(K)]
             loglik_trace[it]    = _compute_loglik(home_x, z, theta, alpha, params)
+            log_Z1_trace[it]    = log_Z1
+            log_Z0_trace[it]    = log_Z0
 
         if it >= S_burn:
             s_idx = it - S_burn
@@ -1039,6 +1048,8 @@ def infer_home_collapsed(
         theta_trace                   = theta_trace,
         state_occ_trace               = state_occ_trace,
         loglik_trace                  = loglik_trace,
+        log_Z1_trace                  = log_Z1_trace,
+        log_Z0_trace                  = log_Z0_trace,
         S_burn                        = S_burn,
     )
 
