@@ -363,7 +363,32 @@ PPCA-EM converges in tens of iterations.
 **Code (planned).** New `_fit_eta_prior()` in
 [`graphical_model.py`](../models/graphical_model.py).
 
-### 2.3 $\omega^{(n)}_t$ — per-home Non-EV std-dev profile
+### 2.3 $\omega^{(n)}_t$ — Non-EV std-dev profile
+
+**Two parameterizations are supported** (selected by `omega_mode` in `ModelParams`):
+
+- **`omega_mode = "global"` (default).** A single $T$-vector $\sigma^{\text{Non-EV}}_t{}^2$ is
+  fit pooled across all training homes at fit time and held **fixed** at
+  inference. No Gibbs block. This is the same structure as the deprecated
+  rank-1 model used for noise (§2.7.4) — only the *mean* side has changed
+  to hierarchical PPCA.
+- **`omega_mode = "hierarchical"`.** Per-home, per-$t$ variance, with IG prior
+  detailed below. Sampled at inference via slice sampling.
+
+**Why is `"global"` the default?** A diagnostic concern about the hierarchical
+parameterization: at inference, the slice sampler can shrink $\omega^{(n)}_t$
+*conditional on the current $z$*. If $z$ flips a timestep to a charging state
+(rightly or wrongly), the residual under that $z$ is small, so the slice
+sampler tightens $\omega[t]$. A tighter $\omega[t]$ makes the off-state
+predictive narrower → smaller residuals look like charging → more flips →
+$\omega$ shrinks further. The "global" parameterization breaks this feedback
+loop by removing $\omega$ from inference entirely.
+
+The hierarchical option is preserved both because it's more theoretically
+expressive and as an A/B for diagnosing how much the feedback loop matters
+in practice.
+
+#### Hierarchical (opt-in) details
 
 **Distribution.** Independently across $t$ and $n$:
 
