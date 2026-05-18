@@ -80,10 +80,17 @@ def _sigma_eta_diag(params) -> np.ndarray:
 
 
 def _omega2_prior_moments(params) -> tuple[np.ndarray, np.ndarray]:
-    """Mean and variance of (omega_t)^2 under InvGamma(a_omega_t, b_omega_t).
+    """Mean and variance of (omega_t)^2 under the prior on omega.
 
-    Returns (E[omega^2], Var[omega^2]). Both shape (T,). Var is NaN for a<=2.
+    For omega_mode='global':
+        mean = sigma2_nev_global,  var = 0 (point parameter)
+    For omega_mode='hierarchical' (InvGamma(a_omega_t, b_omega_t)):
+        mean = b/(a-1), var = b^2 / ((a-1)^2 (a-2))  (NaN if a <= 2)
+
+    Returns (E[omega^2], Var[omega^2]). Both shape (T,).
     """
+    if params.omega_mode == "global":
+        return params.sigma2_nev_global, np.zeros_like(params.sigma2_nev_global)
     a = params.a_omega
     b = params.b_omega
     mean = b / np.maximum(a - 1.0, 1e-12)
@@ -97,12 +104,15 @@ def _omega2_prior_moments(params) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _omega_prior_quantiles(params, q_lo: float = 0.16, q_hi: float = 0.84) -> tuple[np.ndarray, np.ndarray]:
-    """Per-t quantiles of omega_t under the IG prior on omega^2.
+    """Per-t quantiles of omega_t under the prior.
 
-    Returns (omega_q_lo, omega_q_hi) — quantiles of omega (not omega^2),
-    obtained by sqrt of the corresponding omega^2 quantiles.
+    For omega_mode='global', prior is a point mass: both quantiles equal
+    sqrt(sigma2_nev_global). For omega_mode='hierarchical', uses IG quantiles
+    on omega^2 (sqrt for omega).
     """
-    # scipy.stats.invgamma uses shape=a, scale=b (matches our parameterization)
+    if params.omega_mode == "global":
+        sig = np.sqrt(params.sigma2_nev_global)
+        return sig.copy(), sig.copy()
     omega2_lo = stats.invgamma.ppf(q_lo, a=params.a_omega, scale=params.b_omega)
     omega2_hi = stats.invgamma.ppf(q_hi, a=params.a_omega, scale=params.b_omega)
     return np.sqrt(omega2_lo), np.sqrt(omega2_hi)
@@ -205,13 +215,17 @@ def compute_home_background_posterior(
     Lambda_inv = np.linalg.solve(L.T, np.linalg.solve(L, eye_T))
     post_eta_std = np.sqrt(np.maximum(np.diag(Lambda_inv), 0.0))
 
-    # Posterior over omega^2 given eta = post_eta_mean
-    ss_resid = ((x_nev - post_eta_mean[None, :]) ** 2).sum(axis=0)  # (T,)
-    a_post = params.a_omega + D / 2.0
-    b_post = params.b_omega + 0.5 * ss_resid
-    # IG mode = b / (a + 1); take sqrt for omega
-    omega2_map = b_post / (a_post + 1.0)
-    omega_map = np.sqrt(np.maximum(omega2_map, 0.0))
+    # Posterior over omega given eta = post_eta_mean.
+    # DISPATCH: in 'global' mode omega is fixed (point prior); in
+    # 'hierarchical' mode it has an IG posterior whose mode we report.
+    if params.omega_mode == "global":
+        omega_map = np.sqrt(np.maximum(params.sigma2_nev_global, 0.0))
+    else:
+        ss_resid = ((x_nev - post_eta_mean[None, :]) ** 2).sum(axis=0)
+        a_post = params.a_omega + D / 2.0
+        b_post = params.b_omega + 0.5 * ss_resid
+        omega2_map = b_post / (a_post + 1.0)
+        omega_map = np.sqrt(np.maximum(omega2_map, 0.0))
 
     return {
         "empirical_mean":     emp_mean,
