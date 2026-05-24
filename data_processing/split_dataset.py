@@ -1,8 +1,6 @@
 """
-Creates a fixed train/test split and saves two pkl files.
-
-  Train: 9 EV + 45 non-EV = 54 homes  -> splits/train.pkl
-  Test:  3 EV + 15 non-EV = 18 homes  -> splits/test.pkl
+Creates a fixed stratified train/test split (~75/25) and saves two pkl files.
+EV and non-EV homes are split independently so both sets have the same EV ratio.
 """
 
 import pickle
@@ -12,6 +10,7 @@ from pathlib import Path
 DATASET_PATH = Path(__file__).parent / "dataset.pkl"
 SPLITS_DIR   = Path(__file__).parent / "splits"
 SEED = 0
+TRAIN_FRAC = 0.75
 
 with open(DATASET_PATH, "rb") as f:
     dataset = pickle.load(f)
@@ -23,8 +22,11 @@ rng = np.random.default_rng(SEED)
 rng.shuffle(ev_ids)
 rng.shuffle(noev_ids)
 
-train = {d: dataset[d] for d in ev_ids[:9]  + noev_ids[:45]}
-test  = {d: dataset[d] for d in ev_ids[9:]  + noev_ids[45:]}
+n_ev_train   = round(len(ev_ids)   * TRAIN_FRAC)
+n_noev_train = round(len(noev_ids) * TRAIN_FRAC)
+
+train = {d: dataset[d] for d in ev_ids[:n_ev_train]   + noev_ids[:n_noev_train]}
+test  = {d: dataset[d] for d in ev_ids[n_ev_train:]   + noev_ids[n_noev_train:]}
 
 SPLITS_DIR.mkdir(exist_ok=True)
 with open(SPLITS_DIR / "train.pkl", "wb") as f:
