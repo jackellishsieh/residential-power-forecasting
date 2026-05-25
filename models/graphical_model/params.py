@@ -15,6 +15,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .non_ev_lds import LDSParams
+
 
 # ---------------------------------------------------------------------------
 # Shape / state constants
@@ -36,14 +38,9 @@ EM_TOL = 1e-6
 EM_MAX_ITERS = 100
 THETA_VAR_FLOOR = 1e-6
 
-# Non-EV-side (PPCA + omega — current implementation, to be replaced in Stage 2)
-PPCA_RANK_DEFAULT = 5          # rank r for Sigma_eta = W W^T + diag(psi)
-PSI_FLOOR = 1e-6               # floor for per-t residual variance of eta prior
-OMEGA2_FLOOR = 1e-6            # floor for per-home, per-t variance
-SLICE_W = 1.5                  # slice sampler initial step (log-variance units)
-SLICE_MAX_STEPS = 50           # safety cap on stepping-out iterations
-SLICE_MAX_SHRINK = 50          # safety cap on shrinkage iterations
-IG_MIN_SHAPE = 2.01            # a > 2 required for finite IG variance
+# Non-EV-side: LDS EM defaults
+LDS_EM_TOL = 1e-4
+LDS_EM_MAX_ITERS = 50
 
 # State-magnitude semantics for EV charging states (see specs/model.md §1.5).
 # Encoded as truncation on the Theta^(n)_k prior. Off is pinned to 0; bound unused.
@@ -66,14 +63,8 @@ class ModelParams:
       Theta_off, sigma2_theta_off, sigma2_ev_off are fixed (see specs/model.md
       §1.5–1.6).  All other parameters are estimated.
 
-      Sigma_eta = W_eta W_eta.T + diag(psi_eta)  is the PPCA / factor-analyzer
-      prior covariance for the per-home Non-EV mean profile eta^(n) (T-vec).
-
-      omega_mode selects how the Non-EV variance profile is parameterized:
-        "global"       : sigma2_nev_global is a fixed T-vector. No inference-time
-                          Gibbs block. (DEFAULT; recommended.)
-        "hierarchical" : (omega^(n)_t)^2 ~ InvGamma(a_omega_t, b_omega_t).
-                          Sampled at inference via slice sampler.
+      The Non-EV submodel is the per-home daily LDS — its parameters live in
+      `lds` (an `LDSParams` object). See models/graphical_model/non_ev_lds.py.
     """
 
     # EV state (§1)
@@ -86,51 +77,20 @@ class ModelParams:
     sigma2_theta: np.ndarray    # (K,) per-state Theta prior variance. [0] = 0.
     sigma2_ev:   np.ndarray     # (K,) per-state EV emission variance. [0] = SIGMA_EV_OFF^2.
 
-    # Non-EV: hierarchical prior on per-home mean profile eta^(n) ∈ R^T (§2.1–§2.2)
-    eta_bar: np.ndarray         # (T,) global mean profile
-    W_eta:   np.ndarray         # (T, r) PPCA loading matrix
-    psi_eta: np.ndarray         # (T,) per-t residual variance
-
-    # Non-EV variance: one of two parameterizations (§2.3–§2.4)
-    omega_mode: str = "global"                         # "global" | "hierarchical"
-    sigma2_nev_global: np.ndarray | None = None        # (T,) — used iff omega_mode == "global"
-    a_omega: np.ndarray | None = None                  # (T,) — used iff omega_mode == "hierarchical"
-    b_omega: np.ndarray | None = None                  # (T,) — used iff omega_mode == "hierarchical"
+    # Non-EV submodel — per-home daily LDS (§2 of revised specs/model.md)
+    lds: LDSParams
 
     K: int = K
     T: int = T
 
-    def __post_init__(self):
-        if self.omega_mode == "global":
-            if self.sigma2_nev_global is None:
-                raise ValueError("omega_mode='global' requires sigma2_nev_global")
-        elif self.omega_mode == "hierarchical":
-            if self.a_omega is None or self.b_omega is None:
-                raise ValueError("omega_mode='hierarchical' requires a_omega and b_omega")
-        else:
-            raise ValueError(f"unknown omega_mode={self.omega_mode!r}")
-
     @property
-    def ppca_rank(self) -> int:
-        return int(self.W_eta.shape[1])
-
-    def Sigma_eta(self) -> np.ndarray:
-        """Materialize the full T×T prior covariance (for inspection only)."""
-        return self.W_eta @ self.W_eta.T + np.diag(self.psi_eta)
-
-    def expected_omega2(self) -> np.ndarray:
-        """The "best single estimate" of (omega_t)^2 per t under the current
-        parameterization. For omega_mode='global', returns sigma2_nev_global;
-        for 'hierarchical', returns IG prior mean b/(a-1). Shape (T,)."""
-        if self.omega_mode == "global":
-            return self.sigma2_nev_global
-        return self.b_omega / np.maximum(self.a_omega - 1.0, 1e-12)
+    def latent_dim(self) -> int:
+        return self.lds.latent_dim
 
     def summary(self) -> str:
-        r = self.ppca_rank
         lines = [
             "ModelParams summary",
-            "-" * 40,
+            "=" * 40,
             "EV States",
             f"  p_C                 = {self.p_C:.4f}",
             f"  pi_z                = {np.array2string(self.pi_z, precision=4)}",
@@ -147,39 +107,8 @@ class ModelParams:
                 f"sigma^EV={np.sqrt(self.sigma2_ev[k]):.4f}"
             )
 
-        lines.append("\nNon-EV — hierarchical eta prior")
-        lines += [
-            f"  eta_bar             (min={self.eta_bar.min():+.3f}, "
-            f"median={np.median(self.eta_bar):+.3f}, "
-            f"max={self.eta_bar.max():+.3f}, mean={self.eta_bar.mean():+.3f})",
-            f"  W_eta               shape=(T={self.T}, r={r})",
-            f"  psi_eta             (per-t residual variance: "
-            f"min={self.psi_eta.min():.4f}, "
-            f"median={np.median(self.psi_eta):.4f}, "
-            f"max={self.psi_eta.max():.4f})",
-        ]
-
-        lines.append(f"\nNon-EV — omega parameterization: {self.omega_mode!r}")
-        if self.omega_mode == "global":
-            sig_g = np.sqrt(self.sigma2_nev_global)
-            lines += [
-                f"  sigma2_nev_global   (fixed at inference; per-t std-dev: "
-                f"min={sig_g.min():.3f}, median={np.median(sig_g):.3f}, "
-                f"max={sig_g.max():.3f})",
-            ]
-        else:
-            prior_mean = self.b_omega / np.maximum(self.a_omega - 1.0, 1e-12)
-            lines += [
-                f"  a_omega             (IG shape: min={self.a_omega.min():.2f}, "
-                f"median={np.median(self.a_omega):.2f}, "
-                f"max={self.a_omega.max():.2f})",
-                f"  b_omega             (IG rate:  min={self.b_omega.min():.4f}, "
-                f"median={np.median(self.b_omega):.4f}, "
-                f"max={self.b_omega.max():.4f})",
-                f"  E[(omega_t)^2]      (prior mean: min={prior_mean.min():.4f}, "
-                f"median={np.median(prior_mean):.4f}, "
-                f"max={prior_mean.max():.4f})",
-            ]
+        lines.append("\nNon-EV — per-home daily LDS")
+        lines.append(self.lds.summary())
         return "\n".join(lines)
 
 
@@ -189,30 +118,34 @@ class ModelParams:
 
 @dataclass
 class HomeInference:
+    """Per-home output of the Gibbs sampler.
+
+    Memory note: the per-iter LDS latent z^LDS is (D, T) ≈ 35 000 floats.
+    Storing all S samples would balloon memory, so we instead accumulate the
+    posterior mean (`z_lds_mean`) incrementally and keep only the final-iter
+    sample (`z_lds_last`) for visualization. Same for the predictive Non-EV
+    mean E[C z^LDS_d] — accumulated, not stored per-iter.
+    """
     home_id: int
     C_hat: int
-    z_hat: np.ndarray                            # (D, T) MAP states
+    z_hat: np.ndarray                            # (D, T) MAP charging states (EV)
 
-    # Post-burn-in posterior summaries
-    z_marginals: np.ndarray | None = None        # (D, T, K)
-    eta_samples: np.ndarray | None = None        # (S, T)
-    omega2_samples: np.ndarray | None = None     # (S, T)   variance, not std
+    # ---- Per-sample posterior summaries --------------------------------
+    z_marginals:   np.ndarray | None = None      # (D, T, K) p(z_ev | x)
     theta_samples: np.ndarray | None = None      # (S, K)
+    z_lds_mean:    np.ndarray | None = None      # (D, T) posterior mean of z^LDS (accumulated)
+    z_lds_last:    np.ndarray | None = None      # (D, T) last retained sample of z^LDS
 
-    # Per-sample C draws & helpers
-    c_samples: np.ndarray | None = None                       # (S,)  int {0,1}
-    c_from_z_samples: np.ndarray | None = None                # (S,)  any-nonoff indicator
-    z_transitions_per_day_samples: np.ndarray | None = None   # (S,)  float
+    # ---- Per-sample C draws & helpers ----------------------------------
+    c_samples:                     np.ndarray | None = None    # (S,)  int {0,1}
+    c_from_z_samples:              np.ndarray | None = None    # (S,)  any-nonoff indicator
+    z_transitions_per_day_samples: np.ndarray | None = None    # (S,)  float
 
-    # Full iteration traces (burn-in + retained), for convergence diagnostics
-    eta_trace:      np.ndarray | None = None     # (S_burn+S, T)
-    omega2_trace:   np.ndarray | None = None     # (S_burn+S, T)
+    # ---- Full iteration traces (burn-in + retained) --------------------
     theta_trace:    np.ndarray | None = None     # (S_burn+S, K)
     state_occ_trace:np.ndarray | None = None     # (S_burn+S, K)
     loglik_trace:   np.ndarray | None = None     # (S_burn+S,)
-
-    # Collapsed Gibbs only: marginal likelihood traces
-    log_Z1_trace: np.ndarray | None = None       # (S_burn + S,) log p(x | C=1, α, Θ)
-    log_Z0_trace: np.ndarray | None = None       # (S_burn + S,) log p(x | C=0, α)
+    log_Z1_trace:   np.ndarray | None = None     # (S_burn+S,) — collapsed sampler only
+    log_Z0_trace:   np.ndarray | None = None     # (S_burn+S,) — collapsed sampler only
 
     S_burn: int = 0                              # number of burn-in iterations

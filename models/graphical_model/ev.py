@@ -207,23 +207,27 @@ def _charging_loglik(n, theta_hat, S_y, SS_y, mu, sig2_theta, sig2_ev, active):
 # --- Block 2: Theta_k  (truncated-Gaussian conjugate, per state k) -----------
 
 def sample_theta_k(
-    x:      np.ndarray,    # (D, T)
-    z:      np.ndarray,    # (D, T)
-    eta:    np.ndarray,    # (T,)
-    omega2: np.ndarray,    # (T,)
+    x:          np.ndarray,    # (D, T)
+    z:          np.ndarray,    # (D, T)
+    nonev_mean: np.ndarray,    # (D, T)  per-cell Non-EV mean offset (e.g. (C z^LDS)[d,t])
+    nonev_var:  np.ndarray,    # (T,)    per-t Non-EV variance       (e.g. diag(R)[t])
     params: ModelParams,
     k:      int,
     rng,
 ) -> float:
     """Sample Theta_k from its conditional truncated-Normal (specs/model.md §1.5).
 
-        x[d,t] - eta[t]  ~  N( Theta_k, sigma2_ev[k] + omega2[t] )   for (d,t) ∈ T_k
-        Theta_k          ~  N( mu_theta_k, sigma2_theta_k ) · 1[Theta_k ∈ [lb, ub]]
+        x[d,t] - nonev_mean[d,t]  ~  N( Theta_k, sigma2_ev[k] + nonev_var[t] )   for (d,t) ∈ T_k
+        Theta_k                   ~  N( mu_theta_k, sigma2_theta_k ) · 1[Theta_k ∈ [lb, ub]]
 
     The truncation indicator passes through Gaussian conjugacy unchanged, so the
     posterior is the same untruncated-conjugate Normal truncated to [lb, ub].
     Heteroscedastic across (d,t): conditional on z[d,t]=k, variance depends only
     on t, but t varies within the masked set.
+
+    `nonev_mean` is the per-cell Non-EV mean offset under the current Non-EV
+    latents — under the LDS model this is (C z^LDS)[d, t].  `nonev_var` is the
+    per-t Non-EV emission variance — diag(R) under the LDS model.
     """
     sigma2_ev_k = params.sigma2_ev[k]
     sig2_prior  = max(params.sigma2_theta[k], THETA_VAR_FLOOR)
@@ -233,11 +237,11 @@ def sample_theta_k(
     if not mask.any():                                    # no obs in state k: draw from truncated prior
         return _truncnorm_sample(params.mu_theta[k], np.sqrt(sig2_prior), lb, ub, rng)
 
-    var_t     = sigma2_ev_k + omega2                      # (T,) heteroscedastic per t
+    var_t     = sigma2_ev_k + nonev_var                   # (T,) heteroscedastic per t
     inv_var_t = 1.0 / var_t
 
-    # Sufficient statistics: Σ_{(d,t)∈T_k} 1/var_t and Σ_{(d,t)∈T_k} (x-eta)/var_t
-    r = x - eta[None, :]
+    # Sufficient statistics: Σ_{(d,t)∈T_k} 1/var_t and Σ_{(d,t)∈T_k} (x - nonev_mean)/var_t
+    r = x - nonev_mean
     S_inv_var = (mask * inv_var_t[None, :]).sum()
     S_r       = (mask * r * inv_var_t[None, :]).sum()
 
@@ -256,10 +260,10 @@ def _truncnorm_sample(mean: float, sd: float, lb: float, ub: float, rng) -> floa
 # --- Block 1: z  (FFBS — forward filter, backward sample) -------------------
 
 def hmm_forward(
-    x:      np.ndarray,   # (D, T)
-    theta:  np.ndarray,   # (K,)
-    eta:    np.ndarray,   # (T,)
-    omega2: np.ndarray,   # (T,)
+    x:          np.ndarray,   # (D, T)
+    theta:      np.ndarray,   # (K,)
+    nonev_mean: np.ndarray,   # (D, T)   per-cell Non-EV mean offset, e.g. (C z^LDS)[d,t]
+    nonev_var:  np.ndarray,   # (T,)     per-t Non-EV variance, e.g. diag(R)[t]
     params: ModelParams,
     log_pi: np.ndarray,
     log_P:  np.ndarray,
@@ -267,22 +271,29 @@ def hmm_forward(
     """HMM forward pass, vectorized over days.
 
     Emission per (d, t, k):
-        N( x[d,t] ; theta[k] + eta[t], sigma2_ev[k] + omega2[t] )
+        N( x[d,t] ; theta[k] + nonev_mean[d,t], sigma2_ev[k] + nonev_var[t] )
+
+    The per-cell mean lets the Non-EV submodel vary the contribution across
+    days (the LDS submodel does so via the latent z^LDS_d). The per-t
+    variance is constrained to depend only on t — this is what keeps the
+    emission factorisable across t given (z_ev, z_lds), and is why the
+    LDS submodel requires diagonal R (specs/model.md §2).
 
     Returns
     -------
     log_f  : (D, T, K) normalised log filter messages
-    log_Z1 : log p(x | C=1, eta, theta, omega2) accumulated from per-step
-             log-normalisation constants — the marginal likelihood that the
-             collapsed C-step uses.
+    log_Z1 : log p(x | C=1, theta, nonev_mean, nonev_var) accumulated from
+             per-step log-normalisation constants — the marginal likelihood
+             that the collapsed C-step uses.
     """
     D = x.shape[0]
-    combined_var = params.sigma2_ev[:, None] + omega2[None, :]   # (K, T)
+    combined_var = params.sigma2_ev[:, None] + nonev_var[None, :]   # (K, T)
     inv_2var     = 0.5 / combined_var
     log_norm     = -0.5 * np.log(2 * np.pi * combined_var)
 
-    mean_kt  = theta[:, None] + eta[None, :]                     # (K, T)
-    diff     = x[:, :, None] - mean_kt.T[None, :, :]             # (D, T, K)
+    # Emission mean is theta[k] + nonev_mean[d,t]; broadcast to (D, T, K)
+    mean_dtk = nonev_mean[:, :, None] + theta[None, None, :]
+    diff     = x[:, :, None] - mean_dtk
     log_emit = log_norm.T[None, :, :] - diff ** 2 * inv_2var.T[None, :, :]  # (D, T, K)
 
     log_f  = np.empty((D, T, K), dtype=np.float64)
@@ -328,17 +339,17 @@ def hmm_backward_sample(log_f: np.ndarray, params: ModelParams, rng) -> np.ndarr
 
 
 def ffbs(
-    x:      np.ndarray,   # (D, T)
-    theta:  np.ndarray,   # (K,)
-    eta:    np.ndarray,   # (T,)
-    omega2: np.ndarray,   # (T,)
+    x:          np.ndarray,   # (D, T)
+    theta:      np.ndarray,   # (K,)
+    nonev_mean: np.ndarray,   # (D, T)
+    nonev_var:  np.ndarray,   # (T,)
     params: ModelParams,
     log_pi: np.ndarray,
     log_P:  np.ndarray,
     rng,
 ) -> tuple[np.ndarray, float]:
     """Forward-filter backward-sample for z. Returns (z, log_Z1)."""
-    log_f, log_Z1 = hmm_forward(x, theta, eta, omega2, params, log_pi, log_P)
+    log_f, log_Z1 = hmm_forward(x, theta, nonev_mean, nonev_var, params, log_pi, log_P)
     return hmm_backward_sample(log_f, params, rng), log_Z1
 
 

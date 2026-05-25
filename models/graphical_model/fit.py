@@ -5,7 +5,7 @@ returning a populated ModelParams. Each step delegates to a submodel module:
 
     Step 1: EV prevalence p_C            — closed form here
     Step 2: HMM parameters (pi_z, P_z)   — ev.fit_hmm
-    Step 3: Non-EV submodel              — non_ev_ppca.fit_background
+    Step 3: Non-EV LDS submodel          — non_ev_lds.fit_lds_em
     Step 4: Charging magnitudes          — ev.fit_charging_em
 
 See specs/model.md §1–§2 for the math of each step.
@@ -18,16 +18,22 @@ import time
 import numpy as np
 import pandas as pd
 
-from . import ev, non_ev_ppca
+from . import ev, non_ev_lds
 from ._data import build_home_arrays
-from .params import PPCA_RANK_DEFAULT, T, ModelParams
+from .params import LDS_EM_MAX_ITERS, LDS_EM_TOL, T, ModelParams
 
 
 def fit(
     train_df: pd.DataFrame,
     *,
-    ppca_rank: int = PPCA_RANK_DEFAULT,
-    omega_mode: str = "global",
+    lds_init: non_ev_lds.LDSParams | None = None,
+    lds_fit_A: bool = False,
+    lds_fit_C: bool = False,
+    lds_diagonal_Q: bool = True,
+    lds_diagonal_R: bool = True,
+    lds_diagonal_Sigma_0: bool = True,
+    lds_max_iters: int = LDS_EM_MAX_ITERS,
+    lds_tol: float = LDS_EM_TOL,
     verbose: bool = True,
 ) -> ModelParams:
     """Fit all global parameters from a fully-labeled training dataframe.
@@ -35,17 +41,15 @@ def fit(
     Required columns: home_id, day, time_index, total_load, ev_load,
                       non_ev_load, charge_state, has_ev, city.
 
-    ppca_rank  : rank r for the PPCA prior covariance of eta^(n).
-                 r=0 corresponds to a plain diagonal prior diag(psi).
-    omega_mode : Non-EV variance parameterization.
-                 "global"       — fit a single T-vector sigma2_nev_global across
-                                  homes; FIXED at inference. (DEFAULT.)
-                 "hierarchical" — per-home (omega^(n)_t)^2 with IG prior;
-                                  sampled at inference.
+    LDS-related arguments (specs/model.md §2):
+      lds_init             : optional warm-start LDSParams. Defaults to identity-diagonal.
+      lds_fit_A, lds_fit_C : whether EM updates A, C (held at identity by default).
+      lds_diagonal_*       : whether to constrain Q, R, Sigma_0 to be diagonal.
+      lds_max_iters, lds_tol: EM stopping criteria.
     """
     if verbose:
         print("=" * 60)
-        print("FIT: graphical model (hierarchical Non-EV submodel)")
+        print("FIT: graphical model (LDS Non-EV submodel)")
         print("=" * 60)
 
     sorted_df = train_df.sort_values(["home_id", "day", "time_index"])
@@ -95,17 +99,24 @@ def fit(
         print(f"  Step 2 done in {time.time() - t0:.3f}s")
 
     # ------------------------------------------------------------------
-    # Step 3 — Hierarchical Non-EV submodel                     (§2.1–§2.4)
+    # Step 3 — Non-EV LDS submodel                                (§2)
     # ------------------------------------------------------------------
     t0 = time.time()
     if verbose:
-        print(f"\n[Step 3] Non-EV submodel from all {N} homes  "
-              f"(PPCA rank r={ppca_rank}, omega_mode={omega_mode!r})")
-    eta_bar, W_eta, psi_eta, sigma2_nev_global, a_omega, b_omega = non_ev_ppca.fit_background(
-        home_arrays, list(homes),
-        ppca_rank=ppca_rank, omega_mode=omega_mode, verbose=verbose,
-    )                                                              # eta_bar+W+psi via truncated-eigen FA;
-                                                                   # omega via global mean OR IG MoM
+        print(f"\n[Step 3] LDS Non-EV submodel from all {N} homes")
+    nonev_obs_per_home = [home_arrays[hid]["x_nev"] for hid in homes]   # list of (D_n, T) arrays
+    lds = non_ev_lds.fit_lds_em(
+        nonev_obs_per_home,
+        init=lds_init,
+        latent_dim=T,
+        fit_A=lds_fit_A, fit_C=lds_fit_C,
+        diagonal_Q=lds_diagonal_Q,
+        diagonal_R=lds_diagonal_R,
+        diagonal_Sigma_0=lds_diagonal_Sigma_0,
+        max_iters=lds_max_iters,
+        tol=lds_tol,
+        verbose=verbose,
+    )
     if verbose:
         print(f"  Step 3 done in {time.time() - t0:.3f}s")
 
@@ -124,13 +135,10 @@ def fit(
     params = ModelParams(
         p_C=float(p_C),
         pi_z=pi_z, P_z=P_z,
-        eta_bar=eta_bar, W_eta=W_eta, psi_eta=psi_eta,
-        omega_mode=omega_mode,
-        sigma2_nev_global=sigma2_nev_global,
-        a_omega=a_omega, b_omega=b_omega,
         mu_theta=mu_theta,
         sigma2_theta=sigma2_theta,
         sigma2_ev=sigma2_ev,
+        lds=lds,
     )
 
     if verbose:
