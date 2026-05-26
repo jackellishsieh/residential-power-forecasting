@@ -383,6 +383,7 @@ def fit_lds_em(
     latent_dim: int = _DEFAULT_LATENT_DIM,
     fit_A: bool = False,
     fit_C: bool = False,
+    fit_R: bool = False,
     diagonal_Q: bool = True,
     diagonal_R: bool = True,
     diagonal_Sigma_0: bool = True,
@@ -413,7 +414,7 @@ def fit_lds_em(
         D_total = sum(o.shape[0] for o in observations_per_home)
         M = observations_per_home[0].shape[1]
         print(f"  N_homes={N}, total_days={D_total}, obs_dim={M}, latent_dim={latent_dim}")
-        print(f"  fit_A={fit_A}, fit_C={fit_C}, "
+        print(f"  fit_A={fit_A}, fit_C={fit_C}, fit_R={fit_R}, "
               f"diagonal(Q/R/Σ₀)=({diagonal_Q},{diagonal_R},{diagonal_Sigma_0})")
 
     # ---- initialise -----------------------------------------------------
@@ -432,7 +433,7 @@ def fit_lds_em(
         # M-step: closed-form param updates
         params = _em_m_step(
             ss, params,
-            fit_A=fit_A, fit_C=fit_C,
+            fit_A=fit_A, fit_C=fit_C, fit_R=fit_R,
             diagonal_Q=diagonal_Q, diagonal_R=diagonal_R,
             diagonal_Sigma_0=diagonal_Sigma_0,
         )
@@ -530,13 +531,14 @@ def _em_m_step(
     *,
     fit_A: bool,
     fit_C: bool,
+    fit_R: bool,
     diagonal_Q: bool,
     diagonal_R: bool,
     diagonal_Sigma_0: bool,
 ) -> LDSParams:
     """M-step: closed-form updates for whichever parameters are flagged on.
 
-    For parameters held fixed (A or C), we still update Q (resp. R) using the
+    For parameters held fixed (A or C or R), we still update Q (resp. R) using the
     held-fixed value plugged into the standard quadratic-form residual.
     """
     N = ss.N_homes
@@ -569,8 +571,8 @@ def _em_m_step(
     if fit_C and ss.N_total > 0:
         C_new = ss.S_x_z @ np.linalg.inv(ss.S_zz_all)
 
-    # --- R (always update; uses current or updated C) --------------------
-    if ss.N_total > 0:
+    # --- R (optional; uses current or updated C) --------------------
+    if fit_R and ss.N_total > 0:
         R_residual = (
             ss.S_xx
             - C_new @ ss.S_x_z.T

@@ -36,12 +36,9 @@ from .evaluation import evaluate, format_confusion, print_evaluation
 from .fit import fit
 from .inference import (
     build_heuristic_homes,
-    c_prob_from_z_via_heuristic,
     compute_loglik,
     compute_loglik_c0,
-    infer_all,
     infer_all_collapsed,
-    infer_home,
     infer_home_collapsed,
 )
 from .non_ev_lds import (
@@ -73,10 +70,9 @@ __all__ = [
     # Fit
     "fit", "fit_lds_em",
     # Inference
-    "infer_home", "infer_home_collapsed",
-    "infer_all",  "infer_all_collapsed",
+    "infer_home_collapsed", "infer_all_collapsed",
     "compute_loglik", "compute_loglik_c0",
-    "c_prob_from_z_via_heuristic", "build_heuristic_homes",
+    "build_heuristic_homes",
     # LDS internals (useful in validation notebooks)
     "kalman_filter", "rts_smooth", "kalman_sample", "sample_z_lds",
     # Evaluation
