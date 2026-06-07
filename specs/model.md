@@ -6,8 +6,10 @@ state: its **distribution** under the model, how it is treated at **fit time**,
 how it is treated at **inference time**, **why** we chose that approach (and
 what alternatives exist), and **where** it is implemented in code.
 
-All code references point into [`models/graphical_model.py`](../models/graphical_model.py)
-unless otherwise noted.
+Code now lives in the [`models/graphical_model/`](../models/graphical_model/)
+**package** (one module per section: `params.py`, `_data.py`, `ev.py`,
+`non_ev_lds.py`, `fit.py`, `inference.py`, `evaluation.py`); references below
+point into those modules. (The old monolithic `graphical_model.py` is gone.)
 
 ---
 
@@ -30,44 +32,52 @@ contribution:
 $$x^{(n)}_{d,t} = x^{\text{EV},(n)}_{d,t} + x^{\text{Non-EV},(n)}_{d,t}.$$
 
 Each contribution is Gaussian conditional on per-home latents. Under the
-**current/recommended** Non-EV submodel (§2.1–§2.6), the marginal observation
-model used at inference is:
+**current** Non-EV submodel — a per-home **daily linear dynamical system**
+(LDS), §2 — the marginal observation model used at inference is:
 
-$$x^{(n)}_{d,t} \mid z^{(n)}_{d,t}{=}k \sim \mathcal{N}\!\left(\Theta^{(n)}_k + \eta^{(n)}_t,\ (\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2\right),$$
+$$x^{(n)}_{d,t} \mid z^{(n)}_{d,t}{=}k,\ z^{\text{LDS},(n)}_d \sim \mathcal{N}\!\left(\Theta^{(n)}_k + (C\,z^{\text{LDS},(n)}_d)_t,\ (\sigma^{\text{EV}}_k)^2 + R_{tt}\right),$$
 
-with the shorthand $\sigma^2_{k,t} \equiv (\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2$.
-The **deprecated** rank-1 form (§2.7) replaces $\eta^{(n)}_t \to \alpha^{(n)}\rho_t$
-and $(\omega^{(n)}_t)^2 \to (\sigma^{\text{Non-EV}}_t)^2$.
+with the shorthand $\sigma^2_{k,t} \equiv (\sigma^{\text{EV}}_k)^2 + R_{tt}$,
+where $z^{\text{LDS},(n)}_d \in \mathbb{R}^L$ is the home's per-day Non-EV latent
+and $(C, R)$ are global LDS emission parameters. Two earlier Non-EV submodels
+are kept as **deprecated** contrast: the hierarchical-profile PPCA form (§2.4,
+replacing $(C z^{\text{LDS}}_d)_t \to \eta^{(n)}_t$ and $R_{tt} \to (\omega^{(n)}_t)^2$)
+and the rank-1 scale-shape form (§2.5, $\to \alpha^{(n)}\rho_t$ and
+$(\sigma^{\text{Non-EV}}_t)^2$).
 
-> **Implementation status.** The code in [`graphical_model.py`](../models/graphical_model.py)
-> implements the hierarchical-profile form described in §2.1–§2.6.  The
-> deprecated rank-1 submodel (§2.7) has been removed from the code and is
-> kept here only as historical contrast.  Two parameterizations of the
-> per-time variance profile $\omega$ are supported (selected by `omega_mode`
-> in [`ModelParams`](../models/graphical_model.py#L100)); see §2.3.
+> **Implementation status.** The code in
+> [`models/graphical_model/`](../models/graphical_model/) implements the LDS
+> Non-EV submodel (§2) and the **two-track** inference of §4 (C=0 and C=1
+> inferred separately, then compared by model evidence, §5). The PPCA and
+> rank-1 Non-EV submodels, and the old collapsed-$C$ Gibbs sampler, are removed
+> from code and kept here only as deprecated contrast (§2.4–§2.5, §4.4).
 
 ### Phase summary
 
-- **Fit** ([`fit()`](../models/graphical_model.py#L264)) uses fully-labeled
+- **Fit** ([`fit()`](../models/graphical_model/fit.py)) uses fully-labeled
   training data — $C^{(n)}$, $z^{(n)}_{d,t}$, $x^{\text{EV}}$, $x^{\text{Non-EV}}$,
-  and $x$ are all observed — to estimate the global parameter blocks in
-  closed form (apart from a short EM loop for the charging-magnitude block
-  and a small PPCA fit for the $\eta$ prior).  Output is a
-  [`ModelParams`](../models/graphical_model.py#L100) dataclass.
-- **Inference** has two drivers:
-  - [`infer_all()`](../models/graphical_model.py#L1358) — mixture-Gibbs with
-    a logistic-on-transitions heuristic step for $C$ on top of an exact
-    marginal mixture step for $z$.  Legacy / debug.
-  - [`infer_all_collapsed()`](../models/graphical_model.py#L1588) — clean
-    collapsed Gibbs that samples $C$ from its exact marginal posterior
-    (marginalising over $z$ via the HMM forward pass) and then $z$ from
-    the backward conditional.  **Preferred default**; see §4.1.
+  and $x$ are all observed — and runs four steps: (1) EV prevalence $p_C$
+  (closed form), (2) HMM parameters $\pi_z, P_z$ (smoothed counts), (3) the
+  Non-EV LDS parameters (EM), (4) charging-magnitude hyperparameters (EM).
+  Output is a [`ModelParams`](../models/graphical_model/params.py) dataclass.
+- **Inference is two-track** (§4): the two EV hypotheses share no latents or
+  parameters, so each home is inferred under both *separately* and the two are
+  compared by their model evidence (§5).
+  - [`infer_home_c0()`](../models/graphical_model/inference.py) — **C=0**, no
+    sampling: the model collapses to the Non-EV LDS and one exact Kalman
+    smoother gives the $z^{\text{LDS}}$ posterior plus $\log p(x\mid C{=}0)$.
+  - [`infer_home_c1()`](../models/graphical_model/inference.py) — **C=1**,
+    three-block Gibbs over $(\Theta, z^{\text{EV}}, z^{\text{LDS}})$.
+  - [`infer_home()`](../models/graphical_model/inference.py) /
+    [`infer_all()`](../models/graphical_model/inference.py) run both tracks and
+    pick $\hat C$ from the evidence comparison.
 
-  Both consume only $x^{(n)}_{d,t}$ at inference time and Gibbs-sample the
-  per-home latents $(z, \Theta, \eta)$ — plus $\omega$ when `omega_mode='hierarchical'`.
-- **Evaluation** ([`evaluate()`](../models/graphical_model.py#L1686),
-  [`print_evaluation()`](../models/graphical_model.py#L1820)) compares
-  $\hat C^{(n)}$ and $\hat z^{(n)}_{d,t}$ to ground truth via confusion matrices.
+  All consume only $x^{(n)}_{d,t}$ at inference time.
+- **Evaluation** ([`evaluate()`](../models/graphical_model/evaluation.py),
+  [`print_evaluation()`](../models/graphical_model/evaluation.py)) compares
+  $\hat C^{(n)}$ and $\hat z^{(n)}_{d,t}$ to ground truth via confusion matrices;
+  the presentation plots used by the inference notebook live in
+  [`notebooks/utils/infer_plots.py`](../notebooks/utils/infer_plots.py).
 
 ---
 
@@ -80,24 +90,28 @@ and $(\omega^{(n)}_t)^2 \to (\sigma^{\text{Non-EV}}_t)^2$.
 **Fit.** Observed in training. Used only to filter the EV-conditional blocks
 (HMM and charging-magnitude estimators run on $\mathcal{N}^+ = \{n : C^{(n)}{=}1\}$).
 
-**Inference.** Predicted by a **heuristic baseline**, not Gibbs-sampled.
-[`first_diff_logistic.predict`](../models/first_diff_logistic.py#L94) returns
-a binary $\hat C^{(n)}$ from the home's total-load sequence; if
-$\hat C^{(n)}{=}0$ we set $z^{(n)}_{d,t}\equiv\texttt{off}$ and skip Gibbs.
+**Inference.** Decided by a **model-evidence comparison** (§5.1), not sampled.
+For each home we compute the two joint evidences
+$\log p(x, C{=}0)$ and $\log p(x, C{=}1)$ and set
+$\hat C^{(n)} = \mathbb{1}[\log p(x, C{=}1) > \log p(x, C{=}0)]$; the soft
+$\hat P(C{=}1 \mid x)$ is their softmax. The first-diff logistic detector is
+kept **only as a comparison baseline** in the inference notebook, not as the
+model's $C$-predictor.
 
-**Why heuristic, not Gibbs?** The Markov-blanket chain over $C^{(n)}$ is
-degenerate: if any $z^{(n)}_{d,t}\neq\texttt{off}$ then $C^{(n)}=1$ deterministically,
-but the converse fails — the sampler can get stuck at $C=0$, $z\equiv\texttt{off}$
-even when the home is actually an EV home, since flipping $C$ to 1 with all
-$z$'s off has no likelihood reward. The heuristic short-circuits this trap.
-An alternative would be a tempered/reversible-jump scheme that proposes joint
-$(C, z)$ moves, but the heuristic is much simpler and empirically reliable.
+**Why evidence comparison, not a sampled $C$?** The two hypotheses share no
+latents or parameters ($C{=}0$ has only $z^{\text{LDS}}$; $C{=}1$ adds
+$z^{\text{EV}}, \Theta$), so there is nothing to gain from alternating between
+them in one chain. The old collapsed-$C$ Gibbs (§4.4) did exactly that and
+mixed poorly — once the chain committed to a mode it rarely flipped back,
+because moving to $C{=}1$ with all $z^{\text{EV}}{=}\texttt{off}$ earns no
+likelihood reward. Inferring each track separately and comparing their
+evidence sidesteps the trap entirely and is the textbook Bayesian
+model-selection quantity.
 
-**Code.** [`first_diff_logistic.py`](../models/first_diff_logistic.py) (full
-detector — tune via [`tune()`](../models/first_diff_logistic.py#L71), apply via
-[`predict()`](../models/first_diff_logistic.py#L94)). Heuristic dispatch is
-done by the caller; the model itself receives an initial $\hat C^{(n)}$ via
-the `initial_c` argument to [`infer_home()`](../models/graphical_model.py#L781).
+**Code.** Evidence comparison in [`infer_home()`](../models/graphical_model/inference.py)
+(§5.1). The baseline detector is
+[`first_diff_logistic.py`](../models/first_diff_logistic.py), bridged in via
+[`build_heuristic_homes()`](../models/graphical_model/inference.py).
 
 ### 1.2 $p_C$ — EV prevalence
 
@@ -105,11 +119,11 @@ the `initial_c` argument to [`infer_home()`](../models/graphical_model.py#L781).
 
 **Fit.** Empirical mean $\hat p_C = \tfrac{1}{N}\sum_n C^{(n)}$. This is the
 multinomial/Bernoulli MLE; no smoothing needed at this scale. Implemented in
-[`fit()`](../models/graphical_model.py#L264).
+[`fit()`](../models/graphical_model/fit.py).
 
-**Inference.** Unused — EV ownership is decided by the heuristic, not by a
-posterior weighted by $p_C$. (Retained in `ModelParams` for completeness and
-future use, e.g. if we revisit a fully-Bayesian $C^{(n)}$ scheme.)
+**Inference.** Now **used**: it is the $C$ prior in the evidence comparison
+(§5.1), $\log p(x, C{=}c) = \log p(C{=}c) + \log p(x \mid C{=}c)$, with
+$p(C{=}1)=p_C$ and $p(C{=}0)=1-p_C$.
 
 **Why this choice?** Trivial closed-form MLE; alternatives (Beta-Bernoulli
 posterior mean, hierarchical pooling across cohorts) would change estimates
@@ -125,29 +139,29 @@ $z\equiv\texttt{off}$.
 **Fit.** Observed in training; nothing to estimate for $z$ itself (the chain's
 *parameters* $\pi_z, P_z$ are estimated from these labels — see §1.4).
 
-**Inference.** Sampled jointly across $t$ for each day via **vectorized FFBS**
-(forward filter + backward sample, log-space), as Gibbs block 1 inside
-[`infer_home()`](../models/graphical_model.py#L781) /
-[`infer_home_collapsed()`](../models/graphical_model.py#L1413); the core
-routines are [`_hmm_forward()`](../models/graphical_model.py#L1040),
-[`_hmm_backward_sample()`](../models/graphical_model.py#L1086) and the
-wrapper [`_ffbs()`](../models/graphical_model.py#L1108), with backward
-draws delegated to
-[`_sample_categorical_rows()`](../models/graphical_model.py#L1123). Cost is
+**Inference.** Only present under **C=1** (under C=0, $z\equiv\texttt{off}$ and
+nothing is sampled). It is **Block A** of the C=1 Gibbs: sampled jointly across
+$t$ for each day via **vectorized FFBS** (forward filter + backward sample,
+log-space) on the combined-emission likelihood
+$\mathcal{N}(\Theta_k + (C z^{\text{LDS}}_d)_t,\ (\sigma^{\text{EV}}_k)^2 + R_{tt})$,
+which factorizes across $t$ given the current $z^{\text{LDS}}$. Core routines
+[`ev.hmm_forward()`](../models/graphical_model/ev.py),
+[`ev.hmm_backward_sample()`](../models/graphical_model/ev.py) and the wrapper
+[`ev.ffbs()`](../models/graphical_model/ev.py), called from
+[`infer_home_c1()`](../models/graphical_model/inference.py). Cost is
 $O(K^2 T D)$ per iter (\<1 ms in NumPy at $K{=}3, T{=}96, D{\le}360$).
 
-**Posterior summary.** After burn-in, counts $z\text{-counts}[d,t,k]$ are
-accumulated incrementally to avoid storing $S \cdot D \cdot T$ samples, then
-normalized to per-cell marginals; the hard prediction is the argmax over $k$.
+**Posterior summary.** After burn-in, counts `z_counts[d,t,k]` are accumulated
+incrementally to avoid storing $S \cdot D \cdot T$ samples, then normalized to
+per-cell marginals `z_marginals`; the hard prediction `z_hat` is the argmax
+over $k$.
 
 **Why FFBS over single-site Gibbs on $z_{d,t}$?** Adjacent states are strongly
 coupled through $P_z$ (the chain is sticky in `off`); single-site Gibbs would
 mix badly. FFBS is exact-conditional for HMMs and only marginally more code.
 
-**Code.** [`_ffbs()`](../models/graphical_model.py#L1108),
-[`_sample_categorical_rows()`](../models/graphical_model.py#L1123), called from
-the Gibbs loop inside [`infer_home()`](../models/graphical_model.py#L781) and
-[`infer_home_collapsed()`](../models/graphical_model.py#L1413).
+**Code.** [`ev.ffbs()`](../models/graphical_model/ev.py), called from the Gibbs
+loop inside [`infer_home_c1()`](../models/graphical_model/inference.py).
 
 ### 1.4 $\pi_z, P_z$ — HMM initial distribution and transitions
 
@@ -170,13 +184,13 @@ weights and backward-pass sampling kernel.
 **Why MLE here?** Multinomial counts → empirical frequencies are the MLE; there
 is no random-effects structure across homes for the chain parameters (we
 deliberately pool — see "alternatives" below). Smoothing is the only safeguard
-against unobserved cells, which matter with only $N_{\text{EV}}{=}9$ EV homes.
+against unobserved cells, which matter with so few EV homes.
 Alternatives: Dirichlet-multinomial posterior (cosmetically Bayesian, same
 estimates at this scale), or per-home transition matrices with hierarchical
 pooling (justifiable but adds substantial complexity for a question — "does
 this household charge differently?" — that we don't currently care about).
 
-**Code.** [`_fit_hmm()`](../models/graphical_model.py#L417).
+**Code.** [`ev.fit_hmm()`](../models/graphical_model/ev.py).
 
 ### 1.5 $\Theta^{(n)}_k$ — per-home mean charging power in state $k$
 
@@ -193,7 +207,7 @@ in the training data) directly into the prior — without them, an unconstrained
 $\mathcal{N}$ prior makes the two states statistically indistinguishable apart
 from the fitted hyperparameters, which is fragile at inference when the data
 is ambiguous. The bounds live in `THETA_BOUNDS` in
-[`graphical_model.py`](../models/graphical_model.py).
+[`params.py`](../models/graphical_model/params.py).
 
 **Fit.** Observed in training (since $z$ and $x^{\text{EV}}$ are both labeled,
 per-home means $\hat\theta^{(n)}_k = S_y^{(n)} / n^{(n)}_k$ are sufficient
@@ -205,9 +219,12 @@ lie inside $B_k$ by construction of the labels, the bias from omitting the
 truncation normalizer in the M-step is small; verbose mode prints the
 fraction of *prior* probability mass inside $B_k$ as a sanity check.
 
-**Inference.** Gibbs block 2 inside [`infer_home()`](../models/graphical_model.py#L781).
-Conditional on current $z,\eta,\omega$, observations in state $k$ are
-Gaussian with known mean offset and known per-time variance, giving a
+**Inference.** **Block B** of the C=1 Gibbs in
+[`infer_home_c1()`](../models/graphical_model/inference.py).
+Conditional on the current $z^{\text{EV}}$ and $z^{\text{LDS}}$, the residuals
+$x^{(n)}_{d,t} - (C z^{\text{LDS}}_d)_t$ in state $k$ are Gaussian with known
+mean offset $\Theta^{(n)}_k$ and known per-cell variance
+$\sigma^2_{k,t} = (\sigma^{\text{EV}}_k)^2 + R_{tt}$, giving a
 truncated-Gaussian-prior × Gaussian-likelihood update. The indicator
 $\mathbf{1}[\Theta^{(n)}_k \in B_k]$ passes through the Gaussian conjugacy
 unchanged: the posterior is the *same* untruncated-conjugate Normal, truncated
@@ -231,8 +248,11 @@ emissions can still fall outside $B_k$ via $\sigma^{\text{EV}}_k$, which is
 appropriate — real chargers ramp up and down, and per-instance readings
 genuinely can be just below 2 kW even in the "high" state.
 
-**Code.** [`_sample_theta_k()`](../models/graphical_model.py#L1169),
-[`_truncnorm_sample()`](../models/graphical_model.py#L1206).
+**Code.** [`ev.sample_theta_k()`](../models/graphical_model/ev.py) (and
+[`ev.theta_k_posterior_params()`](../models/graphical_model/ev.py), which
+returns the conditional $(m_k, \mathrm{sd}_k, \text{bounds})$ without drawing —
+reused by the Chib estimator, §5.1),
+[`ev._truncnorm_sample()`](../models/graphical_model/ev.py).
 
 ### 1.6 $\mu_{\Theta_k}, \sigma_{\Theta_k}, \sigma^{\text{EV}}_k$ — charging-magnitude hyperparameters
 
@@ -242,12 +262,12 @@ is fixed: $\sigma^{\text{EV}}_{\texttt{off}}=10^{-3}$ (small floor for FFBS
 numerical stability).
 
 **Fit.** **EM** on the one-way Gaussian random-effects model
-([`_fit_charging_em()`](../models/graphical_model.py#L665)). Initialized from
+([`ev.fit_charging_em()`](../models/graphical_model/ev.py)). Initialized from
 unbalanced ANOVA, then iterated to convergence ($|\Delta\log L|<10^{-6}$ or
 100 iters). The E-step computes posterior moments
 $\mathbb{E}[\Theta^{(n)}_k], \mathrm{Var}[\Theta^{(n)}_k]$ given current
 hyperparameters; the M-step is closed form. Marginal log-likelihood is
-monitored via [`_charging_loglik()`](../models/graphical_model.py#L760) and
+monitored via [`ev._charging_loglik()`](../models/graphical_model/ev.py) and
 should be monotone non-decreasing.
 
 **Inference.** Read-only — fixed prior parameters in the conditional
@@ -262,408 +282,150 @@ optimal weighting and adds only ~10 lines per iteration; convergence is fast
 fully-Bayesian sampling of hyperparameters (overkill given $N_{\text{EV}}{=}9$
 is dominated by data, not prior).
 
-**Code.** [`_fit_charging_em()`](../models/graphical_model.py#L665),
-[`_charging_loglik()`](../models/graphical_model.py#L760).
+**Code.** [`ev.fit_charging_em()`](../models/graphical_model/ev.py),
+[`ev._charging_loglik()`](../models/graphical_model/ev.py).
 
 ---
 
-## 2. Non-EV (background) submodel
-
-> §2.1–§2.6 describe the **implemented** hierarchical per-home profile
-> model.  §2.7 is a historical appendix preserving the deprecated rank-1
-> scale-shape model (removed from code) as contrast.
-
-**Per-day, per-home Non-EV emission.** For each home $n$, days are
-conditionally i.i.d. given the per-home profiles:
-
-$$x^{\text{Non-EV},(n)}_{d,t} \stackrel{\text{iid (over }d\text{)}}{\sim} \mathcal{N}\!\left(\eta^{(n)}_t,\ (\omega^{(n)}_t)^2\right).$$
-
-Where the rank-1 model used a *global* shape $\rho_t$ and *global* noise
-$\sigma^{\text{Non-EV}}_t$ modulated only by a per-home scalar $\alpha^{(n)}$,
-the new model gives **every home its own $T$-vector mean profile and
-$T$-vector std-dev profile**, with cross-home shrinkage supplied by
-hierarchical priors. Variable names are chosen distinctively to avoid
-collision with other model components: $\eta^{(n)}_t$ for the *mean* profile,
-$\omega^{(n)}_t$ for the *std-dev* profile.
-
-The covariance across $t$ within a home is **diagonal by construction** —
-this is the property that lets the HMM's FFBS step factorize the emission
-across $t$. Cross-time structure is captured only through the *prior* on
-$\eta^{(n)}$ (§2.2), which is consulted in a separate Gibbs block where the
-HMM is not involved.
-
-### 2.1 $\eta^{(n)}_t$ — per-home Non-EV mean profile
-
-**Distribution.**
-
-$$\eta^{(n)} \stackrel{\text{iid}}{\sim} \mathcal{N}\!\left(\bar\eta,\ \Sigma_\eta\right),\qquad \Sigma_\eta = WW^\top + \mathrm{diag}(\psi),$$
-
-with $\bar\eta\in\mathbb{R}^T$ a global mean profile, $W\in\mathbb{R}^{T\times r}$
-a low-rank factor matrix, and $\psi\in\mathbb{R}^T_{>0}$ a per-time residual
-variance. This is a **probabilistic-PCA / factor-analyzer prior** on
-per-home shapes.  Rank $r$ is a knob: the code's
-[`PPCA_RANK_DEFAULT`](../models/graphical_model.py#L85) is 5, but recent
-experiments use $r{=}20$ (effectively saturating the available rank,
-$\le N{-}1 = 49$) — the truncated-eigen fit (§2.2) is well-conditioned even
-near full rank because of the diagonal residual $\psi$.
-
-**Fit.** Per-home empirical day-mean profile from labeled training data:
-
-$$\hat\eta^{(n)}_t = \tfrac{1}{D^{(n)}}\sum_{d=1}^{D^{(n)}} x^{\text{Non-EV},(n)}_{d,t}.$$
-
-At $D^{(n)} \approx 365$, this is sharp — within-home noise in $\hat\eta^{(n)}_t$
-is $(\omega^{(n)}_t)^2/D^{(n)}$, an order or two below cross-home variation.
-
-**Inference.** Gibbs block 3 (see §4). Operates directly on the observed total
-$x^{(n)}_{d,t}$ using the marginal combined-variance likelihood
-$x^{(n)}_{d,t} - \Theta^{(n)}_{z_{d,t}} \sim \mathcal{N}\!\left(\eta^{(n)}_t,\ \sigma^2_{z_{d,t},t}\right)$
-where $\sigma^2_{k,t} = (\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2$. Conditional
-on current $z, \Theta, \omega^{(n)}$, the likelihood factorizes per $t$ into
-i.i.d. Gaussian observations of $\eta^{(n)}_t$ with **heteroscedastic
-variances** (different $d$ at the same $t$ have different variances because
-$z_{d,t}$ varies); combined with the PPCA prior, the posterior is
-
-$$\eta^{(n)} \sim \mathcal{N}\!\left(\Lambda^{-1}\,h,\ \Lambda^{-1}\right),$$
-
-$$\Lambda = \Sigma_\eta^{-1} + \mathrm{diag}(\lambda_t),\quad \lambda_t = \sum_d \tfrac{1}{\sigma^2_{z_{d,t}, t}},\quad h_t^{(\text{data})} = \sum_d \tfrac{x^{(n)}_{d,t} - \Theta^{(n)}_{z_{d,t}}}{\sigma^2_{z_{d,t}, t}},\quad h = \Sigma_\eta^{-1}\bar\eta + h^{(\text{data})}.$$
-
-$\Sigma_\eta^{-1}$ is computed once per iter via the Woodbury identity
-($O(T r^2)$); the $T \times T$ Cholesky of $\Lambda$ is $\sim 10^5$ flops at
-$T{=}96$ — negligible.
-
-This is the **marginal-likelihood update**: we never sample the latent
-component $x^{\text{Non-EV}}_{d,t}$. The additive decomposition
-$x = x^{\text{EV}} + x^{\text{Non-EV}}$ stays implicit, as in the rank-1
-model — see §2.5 for why we resisted data augmentation here.
-
-**Why hierarchical (and *why low-rank+diagonal*)?**
-
-- *Why per-home shapes at all.* The rank-1 model forces every home to share
-  the same time-of-day pattern $\rho_t$. Empirically, homes vary in lifestyle
-  (early risers vs. WFH vs. night-shift), and one shape can't capture this.
-- *Why a prior at all.* At inference, only total $x$ is observed; per-home
-  shape must be inferred from data that may be contaminated by EV charging.
-  The cross-home prior is what shrinks toward something plausible.
-- *Why low-rank+diagonal rather than diagonal-only.* With $N{=}50$ homes and
-  $T{=}96$ timesteps, the empirical cross-home shape covariance is
-  **rank-deficient by construction** ($\mathrm{rank}\le N{-}1 = 49 < T$).
-  A plain $T{\times}T$ sample-covariance prior isn't invertible. Diagonal
-  $\Sigma_\eta = \mathrm{diag}(\tau_t^2)$ sidesteps this but throws away the
-  genuine cross-time correlations across homes (mornings and evenings
-  co-vary). PPCA $WW^\top + \mathrm{diag}(\psi)$ captures dominant
-  cross-home shape modes in $W$ while remaining well-conditioned. **It also
-  defends against EV absorption:** charging-shaped (narrow, evening-peaked)
-  deviations from $\bar\eta$ are *off the principal subspace*, so the prior
-  pays $\sim 1/\psi_t$ in precision to absorb them. Diagonal-only prior
-  doesn't penalize the *shape* of a deviation, only pointwise magnitude.
-- *Alternatives considered:*
-  - **Low-rank-only basis** $\eta^{(n)} = \Phi c^{(n)}$ with $\Phi\in\mathbb{R}^{T\times J}$
-    fixed (Fourier / spline). Equivalent to $\Sigma_\eta = WW^\top$ with no
-    diagonal residual — a strictly stronger constraint (homes are confined
-    to an exact $J$-dim subspace). Worth keeping as a fallback if EV
-    absorption empirically swamps the PPCA prior. Same Gibbs structure, just
-    sample $c^{(n)}\in\mathbb{R}^J$ instead of $\eta^{(n)}\in\mathbb{R}^T$.
-  - **Ledoit-Wolf shrinkage** $\Sigma_\eta = \lambda\hat\Sigma + (1-\lambda)\mathrm{diag}(\hat\tau^2)$.
-    Auto-tunes $\lambda$ from data; less interpretable but cheap.
-  - **Banded / GP-Matérn covariance.** Imposes stationarity in $t$, which is
-    not obviously true (morning variation ≠ afternoon variation patterns).
-  - **Smoothness prior across $t$** (AR(1) / GP on $\eta^{(n)}$). Subsumed
-    by appropriate choice of $\Sigma_\eta$.
-
-**Risk to flag.** Even with the PPCA prior, the new model is *strictly more
-flexible* than the rank-1 model on the Non-EV side. If real-data $\hat z$
-recovery regresses (Tier-2 eval, §2.6), the diagnosis is most likely that
-genuine non-EV shape variation does include "evening peak"-like directions
-that overlap with charging signatures.
-
-**Code.** Per-home plug-in $\hat\eta^{(n)}$ is computed inside
-[`_fit_background()`](../models/graphical_model.py#L456); the prior fit is
-[`_fit_eta_prior()`](../models/graphical_model.py#L542); the per-iter
-conditional sampler is [`_sample_eta()`](../models/graphical_model.py#L1188)
-with $\Sigma_\eta^{-1}$ pre-cached via Woodbury in
-[`_compute_sigma_eta_inv()`](../models/graphical_model.py#L1173).
-
-### 2.2 $\bar\eta_t, W, \psi$ — hyperparameters of the $\eta$ prior
-
-**Distribution.** Global point-estimated parameters. Together they define
-$\Sigma_\eta = WW^\top + \mathrm{diag}(\psi)$.
-
-**Fit.** Two stages from labeled training data:
-
-1. **Global mean profile.** $\bar\eta_t = \tfrac{1}{N}\sum_n \hat\eta^{(n)}_t$.
-2. **Factor decomposition.** PPCA on centered per-home profiles
-   $\{\hat\eta^{(n)} - \bar\eta\}_{n=1}^N$. Either (a) ML-PPCA via EM, or
-   (b) eigendecomposition of the sample covariance with $W = U_r\Lambda_r^{1/2}$
-   and $\psi$ chosen to absorb residual diagonal variance. Both close to the
-   MLE at $N{=}50$. **Rank choice.** Default $r{=}5$; can raise to 10. Plain
-   diagonal corresponds to $r{=}0$. Full rank requires $N>T$ — infeasible.
-
-**Bias correction.** The per-home plug-in $\hat\eta^{(n)}_t$ has within-home
-noise $(\omega^{(n)}_t)^2 / D^{(n)}$. Sample covariance of $\hat\eta^{(n)}$
-across homes overestimates $\Sigma_\eta$ by
-$\mathrm{diag}\!\left(\tfrac{1}{N}\sum_n (\omega^{(n)}_t)^2 / D^{(n)}\right)$.
-Subtract this from $\psi$ (floor at a small positive value) to debias —
-analogous to Step 3e of the deprecated fit.
-
-**Inference.** Read-only — fixed prior parameters for the $\eta^{(n)}$
-conditional (§2.1).
-
-**Why MoM/EM-PPCA?** With $N{=}50$ samples in $T{=}96$ dimensions, this is the
-small-$N$ regime where regularized estimators (factor analysis with chosen $r$,
-or shrinkage) genuinely beat the empirical sample covariance. Off-the-shelf
-PPCA-EM converges in tens of iterations.
-
-**Code.** [`_fit_eta_prior()`](../models/graphical_model.py#L542) implements
-the truncated-eigen variant (option b above), with bias correction on the
-diagonal as described.
-
-### 2.3 $\omega^{(n)}_t$ — Non-EV std-dev profile
-
-**Two parameterizations are supported** (selected by `omega_mode` in `ModelParams`):
-
-- **`omega_mode = "global"` (default).** A single $T$-vector $\sigma^{\text{Non-EV}}_t{}^2$ is
-  fit pooled across all training homes at fit time and held **fixed** at
-  inference. No Gibbs block. This is the same structure as the deprecated
-  rank-1 model used for noise (§2.7.4) — only the *mean* side has changed
-  to hierarchical PPCA.
-- **`omega_mode = "hierarchical"`.** Per-home, per-$t$ variance, with IG prior
-  detailed below. Sampled at inference via slice sampling.
-
-**Why is `"global"` the default?** A diagnostic concern about the hierarchical
-parameterization: at inference, the slice sampler can shrink $\omega^{(n)}_t$
-*conditional on the current $z$*. If $z$ flips a timestep to a charging state
-(rightly or wrongly), the residual under that $z$ is small, so the slice
-sampler tightens $\omega[t]$. A tighter $\omega[t]$ makes the off-state
-predictive narrower → smaller residuals look like charging → more flips →
-$\omega$ shrinks further. The "global" parameterization breaks this feedback
-loop by removing $\omega$ from inference entirely.
-
-The hierarchical option is preserved both because it's more theoretically
-expressive and as an A/B for diagnosing how much the feedback loop matters
-in practice.
-
-#### Hierarchical (opt-in) details
-
-**Distribution.** Independently across $t$ and $n$:
-
-$$(\omega^{(n)}_t)^2 \stackrel{\text{iid}}{\sim} \mathrm{InvGamma}(a^\omega_t, b^\omega_t).$$
-
-This is the conjugate prior for an unknown variance under Gaussian observations.
-
-**Fit.** Per-home, per-time empirical variance against the fitted mean:
-
-$$\widehat{(\omega^{(n)}_t)^2} = \tfrac{1}{D^{(n)}}\sum_{d=1}^{D^{(n)}} \left(x^{\text{Non-EV},(n)}_{d,t} - \hat\eta^{(n)}_t\right)^2.$$
-
-**Inference.** Gibbs block 4 (see §4). The posterior under the marginal
-combined-variance likelihood is **not conjugate** — the unknown $(\omega^{(n)}_t)^2$
-enters the likelihood through the sum $\sigma^{\text{EV}}_{z_{d,t}}^2 + (\omega^{(n)}_t)^2$,
-not as the full variance. The log-posterior is, scalar per $t$ and
-independent across $t$:
-
-$$\log p\!\left((\omega^{(n)}_t)^2 \,\big|\, z, \Theta, \eta, x\right) \;=\; \log p_{\mathrm{IG}}\!\left((\omega^{(n)}_t)^2; a^\omega_t, b^\omega_t\right) \;-\; \tfrac{1}{2}\sum_d \!\left[\log\sigma^2_{z_{d,t}, t} + \tfrac{(x_{d,t} - \Theta_{z_{d,t}} - \eta^{(n)}_t)^2}{\sigma^2_{z_{d,t}, t}}\right]$$
-
-with $\sigma^2_{k,t} = (\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2$. We sample
-each $(\omega^{(n)}_t)^2$ with a **univariate slice sampler** (Neal 2003)
-with stepping-out and shrinkage, working in log-space
-($\ell = \log(\omega^{(n)}_t)^2$) for scale invariance. Slice sampling is
-tuning-free, robust on unimodal targets, and well-suited to scalar
-posteriors of this form.
-
-**Why per-home, per-$t$?** The rank-1 model used a *globally pooled*
-$\sigma^{\text{Non-EV}}_t$ — every home shares the same noise profile. This is
-clearly wrong: homes differ in HVAC cycling, appliance usage, baseline
-variability. We let homes have their own scale; the hierarchical IG prior
-shares strength across homes.
-
-**Why diagonal across $t$ (independent prior per $t$)?** Emission variance
-enters the FFBS forward pass diagonally; the per-$t$ independence isn't
-required for the slice sampler itself (each $t$ would still be a scalar
-update) but it keeps the prior fit (§2.4) two-parameters-per-$t$ and avoids
-specifying a $T$-dim joint distribution over variances.
-
-**Why slice sampling, not conjugate IG with data augmentation?** Augmenting
-the latent $x^{\text{EV}}, x^{\text{Non-EV}}$ decomposition would restore
-conjugacy (the $\omega$ update becomes $\mathrm{IG}(a + D/2,\ b + \tfrac{1}{2}\sum_d (x^{\text{Non-EV}}_{d,t} - \eta_t)^2)$
-exactly) — at the cost of (a) throwing away the *marginal-likelihood* property
-that made the rank-1 model elegant, (b) introducing autocorrelation between
-augmented latents and $\omega$ samples that empirically slows mixing for
-variance components, and (c) carrying two $(D,T)$ latent arrays in
-`HomeInference`. Slice sampling preserves marginalization and adds only
-~30 lines of code. See §2.5.
-
-**Alternatives considered.**
-- **Conjugate IG with data augmentation.** See §2.5.
-- **Plug-in MAP (Stochastic-EM)** of $(\omega^{(n)}_t)^2$ via 1-D Newton
-  per iter. Faster than slice sampling but discards Bayesian uncertainty
-  over $\omega$.
-- **Log-Normal hierarchy.** More "natural" prior on a positive scale; loses
-  conjugacy *and* doesn't help with the sum-variance non-conjugacy. Rejected.
-- **Half-Cauchy on $\omega^{(n)}_t$** with a higher-level scale. Common in
-  Bayesian hierarchical literature; same non-conjugacy story.
-
-**Code.** Slice sampler in log-space:
-[`_sample_omega()`](../models/graphical_model.py#L1237) and the generic
-1-D slice routine
-[`_slice_sample_1d()`](../models/graphical_model.py#L1297) (stepping-out +
-shrinkage, capped iters).  Fit-time pooled variance for the global mode is
-[`_fit_omega_global()`](../models/graphical_model.py#L516); fit-time
-hierarchical prior is
-[`_fit_omega_prior()`](../models/graphical_model.py#L622).
-
-### 2.4 $a^\omega_t, b^\omega_t$ — hyperparameters of the $\omega$ prior
-
-**Distribution.** Global Inverse-Gamma shape ($a^\omega_t$) and rate ($b^\omega_t$)
-per timestep.
-
-**Fit.** Method-of-moments on $\{\widehat{(\omega^{(n)}_t)^2}\}_{n=1}^N$ across
-homes. Match the empirical mean and variance of the per-home variance
-estimates to the IG mean $b/(a-1)$ and variance $b^2/((a-1)^2(a-2))$
-(requires $a > 2$; floor if needed).
-
-**Inference.** Read-only — fixed prior parameters for the $\omega^{(n)}_t$
-conditional (§2.3).
-
-**Why MoM?** Closed-form, two parameters per $t$, fit from $N{=}50$ samples.
-Alternative: numerical MLE for the IG (no closed form, easy 1-D root-finding).
-MoM is good enough at this $N$.
-
-**Code.** [`_fit_omega_prior()`](../models/graphical_model.py#L622) (only
-populated when `omega_mode='hierarchical'`; in `'global'` mode this is
-skipped and `a_omega, b_omega = None`).
-
-### 2.5 Why we keep $x^{\text{EV}}, x^{\text{Non-EV}}$ marginalized at inference
-
-**The temptation: data augmentation.** Inverse-Gamma is conjugate to
-$\mathcal{N}(\mu, \omega^2)$ but **not** to $\mathcal{N}(\mu, c + \omega^2)$
-where $c = (\sigma^{\text{EV}}_k)^2$ is a known offset. A textbook workaround is
-to sample the latent decomposition $x^{(n)}_{d,t} = x^{\text{EV},(n)}_{d,t} + x^{\text{Non-EV},(n)}_{d,t}$
-as auxiliary variables — the Gaussian-sum conditional is closed form — and
-then use the augmented $\{x^{\text{Non-EV}}_{d,t}\}$ to drive a fully
-conjugate IG update on $(\omega^{(n)}_t)^2$.
-
-**Why we don't do this.** The rank-1 model never decomposed $x$; every Gibbs
-block (FFBS, $\Theta$, $\alpha$) operated on the *marginal* combined-variance
-likelihood. This is structurally elegant *and* avoids a well-known mixing
-pathology of data augmentation for variance components: the augmented
-latents $x^{\text{Non-EV}}_{d,t}$ and the variance $\omega^{(n)}_t$ are
-strongly correlated under the joint posterior, so each Gibbs step moves them
-in lock-step, slowing chain mixing. The cost in raw flops/memory is small
-($DT$ Gaussian draws + two $(D,T)$ arrays), but the mixing cost is the kind
-that hides in 500-iter chains and only shows up when you check trace plots.
-
-**What we do instead.** Slice-sample $(\omega^{(n)}_t)^2$ directly under the
-marginal log-posterior (see §2.3 inference). The other blocks ($\Theta_k$,
-$\eta$) stay as marginal-likelihood conjugate Gaussian updates with
-heteroscedastic-in-$z$ variances — same skeleton as the rank-1 model.
-
-**Cost of slice sampling.** $T$ scalar slice samples per home per iter; each
-needs ~5–10 log-density evaluations, each $O(D)$. Total $O(\text{const}\cdot TD)$ per
-iter — same big-O as augmentation, modestly larger constant. No latent
-$x^{\text{EV}}, x^{\text{Non-EV}}$ arrays in `HomeInference`.
-
-**Falling back to augmentation.** If slice mixing turns out to be poor in
-practice (e.g., heavy-tailed posteriors at small $D^{(n)}$), the augmentation
-path is documented above and ~50 lines of additional code; we can swap in
-without changing other blocks.
-
-### 2.6 Evaluation plan for the migration
-
-Two tiers, in order:
-
-**Tier 1 — synthetic recovery.** Simulate from the new generative model with
-known $\eta^{(n)}, \omega^{(n)}, z, \Theta$ values drawn from priors. Run
-inference end-to-end. Required to pass:
-- $\hat z$ confusion matrix on synthetic data is **no worse than** the
-  rank-1 model's $\hat z$ confusion matrix on *its own* synthetic data
-  (apples to apples — each model evaluated against data from itself).
-- $\hat\eta^{(n)}_t$ recovery MAE $\le$ $\sqrt{\psi_t}$ on average across
-  homes. (We can't expect to beat the prior std when starting from the
-  prior mean; we should at least come within it.)
-- $\widehat{(\omega^{(n)}_t)^2}$ posterior mean MAE $\le$ prior std.
-
-If Tier 1 fails: model is non-identifiable at $N{=}50, D{\approx}365$
-even without model mismatch. Tighten prior (lower $r$, smaller $\psi$, or
-revert to low-rank-only basis $\Sigma_\eta = WW^\top$).
-
-**Tier 2 — real-data parity.** Same held-out evaluation homes, same metrics
-already computed by [`evaluate()`](../models/graphical_model.py#L913):
-$\hat C$ confusion (unchanged — still heuristic) and $\hat z$ confusion
-(EV homes via Gibbs). Required: $\hat z$ confusion doesn't materially
-regress vs. the rank-1 baseline.
-
-If Tier 1 passes but Tier 2 regresses: real non-EV shapes have substantial
-mass in directions the PPCA prior treats as cheap and overlap with charging.
-Mitigations: (a) raise $r$ in PPCA (loosen prior — opposite direction;
-probably wrong); (b) lower $r$ or impose hard basis (tighten prior); (c)
-re-fit with explicit out-of-subspace penalty.
-
-### 2.7 [Deprecated] Rank-1 scale-shape model
-
-> **Deprecated.** This is the *original* Non-EV submodel and is the one
-> currently implemented in code. It is kept here as a contrast to §2.1–§2.6.
-> Migration to the hierarchical-profile form is pending.
-
-The deprecated model factorizes the per-home Non-EV emission as a *global
-shape times a per-home scalar scale*, with a *global per-time noise*:
-
-$$x^{\text{Non-EV},(n)}_{d,t} \stackrel{\text{iid (over }d\text{)}}{\sim} \mathcal{N}\!\left(\alpha^{(n)}\rho_t,\ (\sigma^{\text{Non-EV}}_t)^2\right).$$
-
-#### 2.7.1 $\alpha^{(n)}$ — per-home background scale (deprecated)
-
-**Distribution.** $\alpha^{(n)} \stackrel{\text{iid}}{\sim} \mathcal{N}(\mu_\alpha, \sigma_\alpha^2)$.
-
-**Fit.** Plug-in OLS projection of the home's day-mean profile onto $\rho$:
-
-$$\hat\alpha^{(n)} = \sum_t \hat\beta^{(n)}_t\,\rho_t, \quad \hat\beta^{(n)}_t = \tfrac{1}{D^{(n)}}\sum_d x^{\text{Non-EV},(n)}_{d,t}.$$
-
-**Inference.** Gibbs block 3 inside [`infer_home()`](../models/graphical_model.py#L490):
-Gaussian regression onto fixed regressor $\rho_t$ with heteroscedastic noise
-$\sigma^2_{z_{d,t},t}$:
-
-$$\alpha^{(n)} \sim \mathcal{N}(m_\alpha,\,1/\text{prec}_\alpha),\quad \text{prec}_\alpha = \tfrac{1}{\sigma_\alpha^2} + \sum_{d,t}\tfrac{\rho_t^2}{\sigma^2_{z_{d,t},t}}.$$
-
-**Why deprecated.** Forces a single global shape across all homes — too
-restrictive given real cross-home variation in load patterns.
-
-**Code.** Fit: [`_fit_background()`](../models/graphical_model.py#L300).
-Inference: [`_sample_alpha()`](../models/graphical_model.py#L789).
-
-#### 2.7.2 $\mu_\alpha, \sigma_\alpha^2$ — cross-home scale hyperparameters (deprecated)
-
-**Fit.** $\mu_\alpha = \tfrac{1}{N}\sum_n \hat\alpha^{(n)}$; $\sigma_\alpha^2$
-with bias correction subtracting noise variance of the plug-in:
-
-$$\sigma_\alpha^2 = \max\!\left(0,\ \mathrm{Var}_n(\hat\alpha^{(n)}) - \tfrac{1}{N}\sum_n \tfrac{1}{D^{(n)}}\sum_t \rho_t^2(\sigma^{\text{Non-EV}}_t)^2\right).$$
-
-**Code.** [`_fit_background()`](../models/graphical_model.py#L300).
-
-#### 2.7.3 $\rho_t$ — global normalized intraday background profile (deprecated)
-
-**Distribution.** Global vector $\rho\in\mathbb{R}^T$ with $\|\rho\|_2=1$.
-
-**Fit.** Top right singular vector of the stacked day-mean matrix
-$B\in\mathbb{R}^{N\times T}$ via economy SVD. Sign-fixed so that
-$\mathrm{median}_n(\hat\alpha^{(n)}) > 0$.
-
-**Why deprecated.** A single $\rho$ is the entire rank-1 constraint — see
-"why deprecated" under §2.7.1.
-
-**Code.** [`_fit_background()`](../models/graphical_model.py#L300).
-
-#### 2.7.4 $\sigma^{\text{Non-EV}}_t$ — per-time background emission noise (deprecated)
-
-**Distribution.** Global vector in $\mathbb{R}^T_{>0}$ (pooled across homes).
-
-**Fit.** Pooled residual variance against the per-home fitted mean,
-**individual obs** (not day-means), $\sum_n D^{(n)} \cdot T \approx 1.5$M
-data points:
-
-$$(\sigma^{\text{Non-EV}}_t)^2 = \tfrac{1}{\sum_n D^{(n)}}\sum_n\sum_d \left(x^{\text{Non-EV},(n)}_{d,t} - \hat\alpha^{(n)}\rho_t\right)^2.$$
-
-**Why deprecated.** Pooling forces all homes to share noise scale — wrong
-empirically. Replaced by per-home $\omega^{(n)}_t$ (§2.3).
-
-**Code.** [`_fit_background()`](../models/graphical_model.py#L300).
+## 2. Non-EV (background) submodel — per-home daily LDS
+
+> §2.1–§2.3 describe the **implemented** model. §2.4 (PPCA hierarchical
+> profile) and §2.5 (rank-1 scale-shape) are **deprecated** predecessors,
+> removed from code and kept only as contrast.
+
+The Non-EV background of each home is modelled as a **linear dynamical system
+(LDS) whose time axis is _days_**. The per-day state and per-day observation are
+both $T$-vectors (one entry per 15-min cell), so the model learns how a home's
+*daily load shape* drifts from one day to the next:
+
+$$z^{\text{LDS},(n)}_1 \sim \mathcal{N}(\mu_0,\ \Sigma_0),\qquad
+z^{\text{LDS},(n)}_d \mid z^{\text{LDS},(n)}_{d-1} \sim \mathcal{N}(A\,z^{\text{LDS},(n)}_{d-1},\ Q),\qquad
+x^{\text{Non-EV},(n)}_d \mid z^{\text{LDS},(n)}_d \sim \mathcal{N}(C\,z^{\text{LDS},(n)}_d,\ R).$$
+
+The LDS parameters $(A, C, Q, R, \mu_0, \Sigma_0)$ are **global** (shared across
+homes); only the latent sequence $z^{\text{LDS},(n)}_{1:D}$ is per-home. The
+**current instantiation** (set at construction, relaxable via EM flags) is
+
+$$A = I_L \ \text{(random walk)},\qquad C = I_T\ (L = T),\qquad Q,\, R,\, \Sigma_0\ \text{diagonal}.$$
+
+With $A=I$ the latent is a **random walk over days** — day $d$'s mean shape is
+day $d{-}1$'s plus a Gaussian innovation of covariance $Q$ — and with $C=I$ the
+latent *is* the per-day mean profile in observation space. **A diagonal $R$ is
+the load-bearing constraint**: it makes the emission factorize across $t$, which
+is exactly what lets the EV-side HMM forward pass (§1.3) treat the cells of a day
+independently.
+
+### 2.1 $z^{\text{LDS},(n)}_{d}$ — per-home Non-EV latent sequence
+
+**Distribution.** The Gaussian chain above: a $T$-dim random walk across the
+home's days, $z^{\text{LDS},(n)}_{1:D}\in\mathbb{R}^{D\times L}$.
+
+**Fit.** Not inferred at fit time — training observes $x^{\text{Non-EV}}$
+directly, and only the *parameters* $(A,C,Q,R,\mu_0,\Sigma_0)$ are estimated
+(by EM, §2.2). The latent appears only at inference, when $x^{\text{Non-EV}}$ is
+hidden inside the total $x$.
+
+**Inference.** Depends on the track:
+
+- **C = 0** — $z^{\text{LDS}}$ is the *only* latent, and its posterior is
+  **exact and Gaussian**: one RTS Kalman smoother returns
+  $\mathbb{E}[z^{\text{LDS}}_d \mid x]$ and its covariance. No sampling.
+  ([`infer_home_c0`](../models/graphical_model/inference.py).)
+- **C = 1** — **Block C** of the Gibbs. Conditional on $(z^{\text{EV}}, \Theta)$,
+  the residual $x_{d,t} - \Theta_{z^{\text{EV}}_{d,t}}$ is a linear-Gaussian
+  observation of $z^{\text{LDS}}_d$ with **per-cell extra noise**
+  $(\sigma^{\text{EV}}_{z_{d,t}})^2$ added to $\mathrm{diag}(R)$; one Kalman FFBS
+  pass draws the whole day-sequence jointly.
+  ([`non_ev_lds.sample_z_lds`](../models/graphical_model/non_ev_lds.py).)
+
+The same Kalman machinery serves three roles, all keyed off the per-cell
+`extra_obs_cov` argument: the **exact $C{=}0$ marginal likelihood**
+($z^{\text{EV}}\equiv\texttt{off}$, so $\sigma^{\text{EV}}_{\texttt{off}}{}^2$ is
+added everywhere), the **Block-C sample** under $C{=}1$, and the
+**$z^{\text{LDS}}$-marginal likelihood** used in the $C{=}1$ evidence (§5.1).
+
+**Why an LDS (vs. the deprecated static-profile priors)?** PPCA/rank-1 give each
+home a *single* mean profile shared by all its days. Real homes drift — weekday
+vs. weekend, seasonal HVAC, occupancy changes — and a static profile must
+average over all of it. The LDS lets the profile **evolve day to day** while
+still shrinking neighbouring days together through $Q$. And because the model is
+linear-Gaussian, $z^{\text{LDS}}$ can be **integrated out in closed form** by the
+Kalman filter — that exact marginal is what makes the $C{=}0$ evidence exact and
+the $C{=}1$ evidence (§5.1) tractable.
+
+**Code.** Kalman recursions
+[`kalman_filter` / `rts_smooth` / `kalman_sample` / `kalman_logpdf`](../models/graphical_model/non_ev_lds.py);
+Gibbs adapter [`sample_z_lds`](../models/graphical_model/non_ev_lds.py).
+
+### 2.2 $A, C, Q, R, \mu_0, \Sigma_0$ — global LDS parameters
+
+**Distribution.** Global point-estimated parameters. Shapes
+$A,Q,\Sigma_0\in\mathbb{R}^{L\times L}$, $C\in\mathbb{R}^{T\times L}$,
+$R\in\mathbb{R}^{T\times T}$, $\mu_0\in\mathbb{R}^L$. Current setup: $A=C=I$ and
+$Q,R,\Sigma_0$ diagonal.
+
+**Fit.** **EM** over all training homes' $x^{\text{Non-EV}}$ sequences
+([`fit_lds_em`](../models/graphical_model/non_ev_lds.py)). Each E-step runs the
+Kalman smoother per home and accumulates Gaussian sufficient statistics; each
+M-step is the closed-form LDS update. By default $A,C$ are **held at identity**
+(`fit_A=fit_C=False`) and only $\mu_0,\Sigma_0,Q,R$ are updated, then projected
+to diagonal; flags `fit_A` / `fit_C` / `fit_R` relax this without code changes.
+Convergence: $|\Delta\log L|/|\log L| < 10^{-4}$ or 50 iters.
+
+**Inference.** Read-only — the fixed LDS used by every Kalman pass above.
+
+**Why EM (and why hold $A=C=I$)?** With $x^{\text{Non-EV}}$ observed in training
+the smoother is exact, so EM climbs quickly to the MLE. Holding $A=C=I$ keeps the
+latent **interpretable** (it is literally the per-day load profile) and the model
+identifiable at $L=T=96$, while diagonal $Q,R$ preserve the factorize-across-$t$
+structure the HMM relies on. Learning full $A,C$ is available but has not been
+needed.
+
+**Code.** [`fit_lds_em`, `_em_e_step`, `_em_m_step`](../models/graphical_model/non_ev_lds.py).
+
+### 2.3 Coupling to the EV side (per-cell observation noise)
+
+The EV and Non-EV submodels meet only through the **shared observation** $x$ and
+the **per-cell variance** $\sigma^2_{k,t} = (\sigma^{\text{EV}}_k)^2 + R_{tt}$.
+At inference this is implemented by passing the per-cell EV variance
+$(\sigma^{\text{EV}}_{z_{d,t}})^2$ as an *extra additive observation covariance*
+on top of $R$ in the Kalman pass — the `extra_obs_cov` argument of
+[`kalman_filter`](../models/graphical_model/non_ev_lds.py). The latent
+decomposition $x = x^{\text{EV}} + x^{\text{Non-EV}}$ is **never sampled**; it
+stays marginalized throughout (the additive-Gaussian structure makes this free).
+
+### 2.4 [Deprecated] Hierarchical-profile PPCA model
+
+> **Deprecated.** Superseded by the LDS (§2.1–§2.3); removed from code, kept as
+> contrast. It modelled each home's Non-EV days as i.i.d. around a *single*
+> per-home mean profile — no across-day dynamics.
+
+$$x^{\text{Non-EV},(n)}_{d,t} \stackrel{\text{iid over }d}{\sim} \mathcal{N}\!\left(\eta^{(n)}_t,\ (\omega^{(n)}_t)^2\right),\qquad \eta^{(n)}\sim\mathcal{N}\!\left(\bar\eta,\ WW^\top + \mathrm{diag}(\psi)\right).$$
+
+The per-home mean profile $\eta^{(n)}\in\mathbb{R}^T$ carried a probabilistic-PCA
+(factor-analyzer) cross-home prior — a global mean $\bar\eta$ plus a low-rank +
+diagonal covariance fit from the $N$ training profiles — and the std profile
+$\omega^{(n)}_t$ was either pooled-global or per-home with an Inverse-Gamma prior
+(slice-sampled). Inference Gibbs-sampled $\eta^{(n)}$ as a $T$-dim Gaussian
+conditional, integrating the $x$-decomposition out via the same
+combined-variance trick as §2.3. **Why dropped:** a static per-home profile
+cannot track day-to-day drift, which the LDS captures while staying
+linear-Gaussian (hence Kalman-integrable). The PPCA prior's job — shrinking home
+shapes toward plausible directions — is played in the LDS by $\Sigma_0$ and $Q$.
+
+### 2.5 [Deprecated] Rank-1 scale-shape model
+
+> **Deprecated.** The *original* Non-EV submodel. Every home shared a single
+> global intraday shape $\rho_t$ ($\|\rho\|_2{=}1$), scaled by one per-home scalar.
+
+$$x^{\text{Non-EV},(n)}_{d,t} \stackrel{\text{iid over }d}{\sim} \mathcal{N}\!\left(\alpha^{(n)}\rho_t,\ (\sigma^{\text{Non-EV}}_t)^2\right),\qquad \alpha^{(n)}\sim\mathcal{N}(\mu_\alpha,\ \sigma_\alpha^2).$$
+
+$\rho$ was the top right singular vector of the stacked day-mean matrix; the
+per-home scale $\alpha^{(n)}$ was Gibbs-sampled by Gaussian regression onto
+$\rho$ with heteroscedastic-in-$z$ noise; the noise profile
+$\sigma^{\text{Non-EV}}_t$ was pooled across homes. **Why dropped:** one global
+shape for every household is far too rigid — superseded first by per-home PPCA
+profiles (§2.4), then by the LDS (§2.1).
 
 ---
 
@@ -673,135 +435,247 @@ empirically. Replaced by per-home $\omega^{(n)}_t$ (§2.3).
 
 **Definition.** $x^{(n)}_{d,t} = x^{\text{EV},(n)}_{d,t} + x^{\text{Non-EV},(n)}_{d,t}$
 with independent Gaussian summands, so the marginal emission used at inference
-is, **under the new model:**
+is, **under the current LDS model:**
 
-$$x^{(n)}_{d,t} \mid z^{(n)}_{d,t}{=}k \sim \mathcal{N}\!\left(\Theta^{(n)}_k + \eta^{(n)}_t,\ \sigma^2_{k,t}\right),\quad \sigma^2_{k,t} = (\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2.$$
+$$x^{(n)}_{d,t} \mid z^{(n)}_{d,t}{=}k,\ z^{\text{LDS},(n)}_d \sim \mathcal{N}\!\left(\Theta^{(n)}_k + (C\,z^{\text{LDS},(n)}_d)_t,\ \sigma^2_{k,t}\right),\quad \sigma^2_{k,t} = (\sigma^{\text{EV}}_k)^2 + R_{tt}.$$
 
-(Under the deprecated rank-1 model: $\eta^{(n)}_t \to \alpha^{(n)}\rho_t$ and
-$(\omega^{(n)}_t)^2 \to (\sigma^{\text{Non-EV}}_t)^2$.)
+(Under the deprecated submodels the Non-EV mean offset becomes $\eta^{(n)}_t$
+(PPCA, §2.4) or $\alpha^{(n)}\rho_t$ (rank-1, §2.5), and $R_{tt}$ becomes
+$(\omega^{(n)}_t)^2$ or $(\sigma^{\text{Non-EV}}_t)^2$.)
 
 **Fit.** Fully observed in training; both components $x^{\text{EV}}$,
 $x^{\text{Non-EV}}$ are also separately observed (training is on labeled data).
 
 **Inference.** The *only* observed variable. Drives the FFBS emission
-likelihoods in block 1 and the data terms in blocks 2–4. Crucially, the
-latent decomposition $x = x^{\text{EV}} + x^{\text{Non-EV}}$ is **not
-sampled** — it stays marginalized throughout, exactly as in the rank-1
-model (see §2.5).
+likelihoods in Block A and the data terms in Blocks B–C (and the exact $C{=}0$
+smoother). Crucially, the latent decomposition
+$x = x^{\text{EV}} + x^{\text{Non-EV}}$ is **not sampled** — it stays
+marginalized throughout (see §2.3).
 
 **Code.** Total-power arrays are assembled per home by
-[`_build_home_arrays()`](../models/graphical_model.py#L391); used throughout
-[`infer_home()`](../models/graphical_model.py#L781) and
-[`infer_home_collapsed()`](../models/graphical_model.py#L1413).
+[`build_home_arrays()`](../models/graphical_model/_data.py); used throughout
+[`infer_home_c0()`](../models/graphical_model/inference.py) and
+[`infer_home_c1()`](../models/graphical_model/inference.py).
 
 ---
 
-## 4. Inference loop (cross-cutting)
+## 4. Inference loop (two-track)
 
-Per-home Gibbs sampler.  Two drivers are provided; both consume only
-$x^{(n)}_{d,t}$ at inference time:
+The two EV hypotheses **share no parameters or latents**, so there is no reason
+to alternate between them in a single chain (the old collapsed-$C$ Gibbs did;
+see §4.4). Instead each home is inferred under both hypotheses *separately* and
+the two are compared by their evidence (§5). Both tracks consume only
+$x^{(n)}_{d,t}$ at inference time. Implemented in
+[`models/graphical_model/inference.py`](../models/graphical_model/inference.py).
 
-- [`infer_home()`](../models/graphical_model.py#L781): the original
-  mixture-Gibbs sampler.  Each iteration does an exact marginal mixture step
-  on $z$ (FFBS proposal weighted vs all-off by $p_C$) **and**, separately,
-  a logistic-on-transitions step on $C$.  Retained for backward compat /
-  diagnostics; the two $C$-related steps look at slightly different posteriors.
-- [`infer_home_collapsed()`](../models/graphical_model.py#L1413): the clean
-  collapsed Gibbs.  Each iteration samples $C$ from its exact marginal
-  posterior $p(C \mid x, \Theta, \eta, \omega)$ (marginalising over $z$ via
-  the HMM forward pass), then $z \mid C$ from the backward sample.  No
-  logistic regression; **preferred default for new work**.
+### 4.1 Track C = 0 (no EV) — exact, no sampling
 
-Both apply the per-home Gibbs blocks below; the only difference is the $C$
-update.
+Under $C=0$, $z^{(n)}_{d,t}\equiv\texttt{off}$ and $\Theta$ is irrelevant, so
+the model collapses to the Non-EV daily LDS (§2). The only latent is
+$z^{\text{LDS}}_{1:D}$, whose posterior is Gaussian and **exact**: a single
+Kalman smoother yields its mean/covariance, and the Kalman filter's marginal
+likelihood gives $\log p(x \mid C{=}0)$ with $z^{\text{LDS}}$ integrated out.
+The off-state EV variance $\sigma^{\text{EV}}_{\texttt{off}}{}^2$ is added to
+$\operatorname{diag}(R)$ so the expression matches the $C=1$ likelihood at
+$z^{EV}\equiv\texttt{off}$. [`infer_home_c0()`](../models/graphical_model/inference.py).
 
-### 4.1 Block structure (current implementation)
+### 4.2 Track C = 1 (EV) — three-block Gibbs
 
-Each iteration executes the following blocks in order.  Latent components
-$x^{\text{EV}}, x^{\text{Non-EV}}$ remain *marginalized throughout* (see §2.5).
+With $C=1$ fixed, $z^{EV}$ is free and we run a three-block Gibbs over
+$(\Theta, z^{EV}, z^{\text{LDS}})$. Latent components
+$x^{\text{EV}}, x^{\text{Non-EV}}$ remain *marginalized throughout* (§2.5).
 
-1. **FFBS for $z^{(n)}_{d,t}$** (§1.3). Combined-emission likelihood
-   $\mathcal{N}(\Theta^{(n)}_k + \eta^{(n)}_t,\ (\sigma^{\text{EV}}_k)^2 + (\omega^{(n)}_t)^2)$.
-   Factorizes across $t$ given current parameters.
-2. **$\Theta^{(n)}_k$** for $k\in\{\texttt{low},\texttt{high}\}$ (§1.5).
-   Conjugate Gaussian on residuals $x^{(n)}_{d,t} - \eta^{(n)}_t$ over
-   $(d,t)\in\mathcal{T}_k$, with heteroscedastic variance
-   $\sigma^{\text{EV}}_k{}^2 + \omega^{(n)}_t{}^2$.
-3. **$\eta^{(n)}$** (§2.1). $T$-dim Gaussian conjugate update on residuals
-   $x^{(n)}_{d,t} - \Theta^{(n)}_{z_{d,t}}$ with per-cell heteroscedastic
-   variance $\sigma^2_{z_{d,t}, t}$ and PPCA prior
-   $\mathcal{N}(\bar\eta, \Sigma_\eta)$. $T\times T$ Cholesky; Woodbury for
-   $\Sigma_\eta^{-1}$ (cached once per `infer_home` call since
-   $\Sigma_\eta$ doesn't depend on iter state).
-4. **$\omega^{(n)}_t$** (§2.3).  **Only executed when `omega_mode='hierarchical'`.**
-   Univariate slice sample in log-space per $t$, on the marginal log-posterior
-   with IG prior.  In `omega_mode='global'` (default) this block is skipped
-   and $\omega^2_t = \sigma^{\text{Non-EV}}_t{}^2$ stays fixed for the chain.
+1. **Block A — $z^{(n)}_{d,t}$** (§1.3) via HMM forward-filter backward-sample.
+   Combined-emission likelihood
+   $\mathcal{N}(\Theta^{(n)}_k + (C z^{\text{LDS}}_d)_t,\ (\sigma^{\text{EV}}_k)^2 + R_{tt})$,
+   factorizing across $t$ given the current $z^{\text{LDS}}$.
+2. **Block B — $\Theta^{(n)}_k$** for $k\in\{\texttt{low},\texttt{high}\}$ (§1.5).
+   Truncated-Normal conjugate on residuals
+   $x^{(n)}_{d,t} - (C z^{\text{LDS}}_d)_t$ over $(d,t)\in\mathcal{T}_k$, with
+   heteroscedastic variance $\sigma^{\text{EV}}_k{}^2 + R_{tt}$.
+3. **Block C — $z^{\text{LDS}}_{1:D}$** (§2) via Kalman FFBS on the residual
+   $x - \Theta_{z^{EV}}$, with per-cell extra observation noise
+   $\sigma^{\text{EV}}_{z_{d,t}}$ added to $\operatorname{diag}(R)$.
 
-**Initialization.** $\eta^{(n)} = \bar\eta$,
-$\Theta^{(n)}_k = \mu_{\Theta_k}$, $z\equiv\texttt{off}$, and
-$\omega^2_t = \sigma^{\text{Non-EV}}_t{}^2$ (global mode) or
-$\omega^2_t = b^\omega_t / (a^\omega_t + 1)$ (hierarchical IG mode).
-`infer_home` additionally accepts warm-start values for $(C, z)$ via the
-`initial_c` / `initial_z` arguments (used to seed from the heuristic
-detector); `infer_home_collapsed` always cold-starts.
+**Initialization.** $z^{\text{LDS}}$ = Kalman-smoother mean of $x$ (treats $x$
+as all-Non-EV), $\Theta_k = \mu_{\Theta_k}$, $z^{EV}\equiv\texttt{off}$. Always
+cold-starts. [`infer_home_c1()`](../models/graphical_model/inference.py).
 
 **Schedule.** Default $S_{\text{burn}}=200$ burn-in + $S=500$ retained iters.
 
-**Accumulation.** $z$-counts incrementally post-burn-in; per-iter
-$\eta^{(n)} \in \mathbb{R}^T$, $\omega^{(n)} \in \mathbb{R}^T$, and
-$\Theta^{(n)} \in \mathbb{R}^K$ samples retained (cheap; $S\cdot T$ and
-$S\cdot K$ floats per home).
+**Accumulation.** $z^{EV}$-counts incrementally post-burn-in; per-iter
+$\Theta^{(n)}\in\mathbb{R}^K$ retained, and the predictive Non-EV mean
+$\mathbb{E}[C z^{\text{LDS}}_d]$ accumulated (not stored per-iter). Optionally
+the full $z^{EV}$ samples are retained (`retain_z_ev=True`) for the Chib
+estimator (§5, B).
 
-**Computational budget.** FFBS dominates ($O(K^2 T D)$); block 2 is
-$O(\sum_k|\mathcal{T}_k|) = O(DT)$; block 3 is $O(DT + T^3 + Tr^2)$ with
-$T^3 \approx 10^6$ at $T{=}96$; block 4 (only in hierarchical mode) is
-$O(\text{slice-evals}\cdot TD)$ with typically 5–10 evals per slice.  Total
-runtime stays under a few minutes for a handful of EV homes.
+**Computational budget.** FFBS over $z^{EV}$ is $O(K^2 T D)$; block B is
+$O(DT)$; block C (Kalman FFBS over days, each step a $T$-dim Gaussian) is
+$O(D\,T^3)$ with $T^3\approx 10^6$ at $T{=}96$ — the dominant cost. The exact
+$C=0$ smoother is one such Kalman pass. Total runtime stays under a few minutes
+for a handful of homes.
 
-### 4.2 [Removed] Deprecated three-block Gibbs
+### 4.3 Drivers
 
-The old rank-1 model used blocks $z \to \Theta \to \alpha$ (scalar regression
-on $\alpha^{(n)}$).  No longer in the code; see §2.7 for the math, kept as
-contrast only.
+[`infer_home()`](../models/graphical_model/inference.py) runs both tracks for one
+home and compares them; [`infer_all()`](../models/graphical_model/inference.py)
+maps it over homes. [`build_heuristic_homes()`](../models/graphical_model/inference.py)
+bridges the heuristic detector in as a comparison baseline.
 
-### 4.3 Cross-cutting
+### 4.4 [Deprecated] Collapsed-$C$ Gibbs (contrast only)
 
-- **Log-likelihood tracking.** [`_compute_loglik()`](../models/graphical_model.py#L1000)
-  for EV homes (complete-data likelihood under the hierarchical model);
-  [`_compute_loglik_c0()`](../models/graphical_model.py#L1019) for the
-  all-off branch used in the C-mixture step.  Both use the combined-variance
-  emission $\mathcal{N}(\Theta_k + \eta_t, \sigma^2_{k,t})$.
-- The drivers [`infer_all()`](../models/graphical_model.py#L1358) and
-  [`infer_all_collapsed()`](../models/graphical_model.py#L1588) iterate
-  over homes; [`c_prob_from_z_via_heuristic()`](../models/graphical_model.py#L1637)
-  and [`build_heuristic_homes()`](../models/graphical_model.py#L1669) bridge
-  the heuristic detector into the per-home inference pipeline.
-- **Memory per home.** Dominated by $z$-counts of shape $(D, T, K)$ — under
-  1 MB.  No latent $x^{\text{EV}}, x^{\text{Non-EV}}$ arrays are stored
-  (marginalization is preserved; see §2.5).
+The previous sampler alternated a $C$-block into a single chain: each iteration
+drew $C$ from its exact Bernoulli posterior
+$p(C \mid x, z^{\text{LDS}}, \Theta)$ (HMM forward pass for the $C=1$ marginal
+vs the $z\equiv\texttt{off}$ likelihood for $C=0$, weighted by $p_C$), then
+$z^{EV}\mid C$. This conflated model selection with state inference and mixed
+poorly once $C$ committed to a mode (the chain rarely flipped back). Removed in
+favour of the two independent tracks above + an explicit evidence comparison.
+Even older still: the rank-1 model's $z\to\Theta\to\alpha$ blocks (§2.5).
 
 ---
 
 ## 5. Evaluation
 
-Implemented in [`evaluate()`](../models/graphical_model.py#L1686) and reported
-by [`print_evaluation()`](../models/graphical_model.py#L1820). Two confusion
-matrices:
+Implemented in [`evaluate()`](../models/graphical_model/evaluation.py) and
+reported by [`print_evaluation()`](../models/graphical_model/evaluation.py).
+Two confusion matrices:
 
 - **EV ownership.** $2\times 2$ confusion of $\hat C^{(n)}$ vs true $C^{(n)}$
   across all evaluation homes
-  ([`_c_confusion_from_probs()`](../models/graphical_model.py#L1782)).
+  ([`_c_confusion_from_probs()`](../models/graphical_model/evaluation.py)).
 - **Charging state.** $3\times 3$ confusion of $\hat z^{(n)}_{d,t}$ vs true
-  $z^{(n)}_{d,t}$ across all $(n,d,t)$ triples on EV homes (hard:
-  [`_per_home_z_confusion_hard()`](../models/graphical_model.py#L1753); soft:
-  [`_per_home_z_confusion_soft()`](../models/graphical_model.py#L1765);
-  averaging: [`_nanmean_cms()`](../models/graphical_model.py#L1776)).
+  $z^{(n)}_{d,t}$ over $(n,d,t)$ on EV homes — per-home **row-normalised
+  recall**, then averaged over homes so every home counts equally (hard:
+  [`_per_home_z_confusion_hard()`](../models/graphical_model/evaluation.py);
+  soft: [`_per_home_z_confusion_soft()`](../models/graphical_model/evaluation.py)).
 
 For comparison, the heuristic's own per-timestep state output
-([`first_diff_logistic.predict`](../models/first_diff_logistic.py#L94)) is
-also evaluated against the same ground truth — this is the baseline against
-which the Gibbs sampler is compared.
+([`first_diff_logistic.predict`](../models/first_diff_logistic.py)) is also
+evaluated against the same ground truth — the baseline against which the Gibbs
+sampler is compared. The inference notebook's presentation plots (confusion
+matrices, $z^{\text{EV}}$ carpet heatmaps, charging-magnitude and
+model-evidence figures) live in
+[`notebooks/utils/infer_plots.py`](../notebooks/utils/infer_plots.py).
+
+### 5.1 EV-ownership decision via model evidence
+
+This section explains, from the ground up, **how we turn each home's data into a
+yes/no EV decision and a probability** — the part the project leans on most.
+
+#### The quantity we want
+
+We never sample $C$. Instead we score the two hypotheses by their **model
+evidence** — the probability the hypothesis assigns to the data — and pick the
+larger:
+
+$$\log p(x, C{=}c) \;=\; \underbrace{\log p(C{=}c)}_{\text{prior}} \;+\; \underbrace{\log p(x \mid C{=}c)}_{\text{marginal likelihood}}, \qquad c\in\{0,1\}.$$
+
+The prior is just $p(C{=}1)=p_C$, $p(C{=}0)=1-p_C$. The hard part is the
+**marginal likelihood** $\log p(x\mid C{=}c)$: the probability of the observed
+total power $x$ under hypothesis $c$, *with all that hypothesis's latent
+variables integrated (summed/averaged) out*. "Integrated out" is what makes it a
+fair contest — each hypothesis is judged on how well it explains $x$ on its own
+terms, not at one lucky setting of its latents.
+
+The final decision and its soft version are
+$$\hat C = \mathbb{1}\!\left[\log p(x, C{=}1) > \log p(x, C{=}0)\right], \qquad \hat P(C{=}1\mid x) = \operatorname{softmax}\big(\log p(x,C{=}0),\ \log p(x,C{=}1)\big)$$
+([`HomeResult.c_prob`](../models/graphical_model/params.py)).
+
+#### The easy side: $\log p(x \mid C{=}0)$ is exact
+
+Under $C{=}0$ the only latent is $z^{\text{LDS}}$, and *everything is Gaussian*.
+A Gaussian latent can be integrated out in closed form — that is precisely what
+the **Kalman filter** computes as a by-product: $\log p(x\mid C{=}0) = \sum_d
+\log p(x_d \mid x_{1:d-1})$, with $z^{\text{LDS}}$ already integrated. So the
+$C{=}0$ evidence is **exact**, no sampling
+([`lds_loglik_c0`](../models/graphical_model/inference.py); the off-state EV
+variance $\sigma^{\text{EV}}_{\texttt{off}}{}^2$ is added to $\mathrm{diag}(R)$
+so it lines up with the $C{=}1$ expression at $z^{\text{EV}}\equiv\texttt{off}$).
+
+#### The hard side: $\log p(x \mid C{=}1)$ is intractable
+
+Under $C{=}1$ the latents are $\psi = (z^{\text{EV}}, \Theta, z^{\text{LDS}})$,
+and getting the marginal likelihood means summing over **every** charging-state
+configuration $z^{\text{EV}}$ — that is $3^{D\times T}$ discrete paths — while
+also integrating $\Theta$ and $z^{\text{LDS}}$. There is no closed form. We offer
+three estimators, from cheap-and-rough to exact-but-slow.
+
+**(A) Plug-in joint — cheap, but NOT comparable to $C{=}0$.** Evaluate the
+complete-data joint density once, at a representative posterior point
+$\psi^* = (z^{\text{EV}*}, \Theta^*, z^{\text{LDS}*})$ ($z^{\text{EV}*}=$ the MAP
+of the per-cell marginals, $\Theta^*=$ posterior mean, $z^{\text{LDS}*}=$ its
+conditional smoother mean):
+$$\log p(C{=}1) + \log p\big(x, z^{\text{EV}*}, z^{\text{LDS}*}\mid C{=}1, \Theta^*\big).$$
+The catch: this is a density over $(x, z^{\text{EV}}, z^{\text{LDS}})$ — it
+includes the $\sim\!(D\times L)$-dimensional $\log p(z^{\text{LDS}*})$ prior
+term — so it lives in a **much higher-dimensional space** than
+$\log p(x\mid C{=}0)$ (a density over $x$ alone). Its absolute value is not on
+the same scale, so it **must not be compared** to the $C{=}0$ evidence.
+([`log_joint_c1_plugin`](../models/graphical_model/inference.py).)
+
+**(A′) $z^{\text{LDS}}$-marginal — the default decision (`decision='rb'`).**
+Keep the discrete $z^{\text{EV}}$ plugged in at $z^{\text{EV}*}$, but **integrate
+$z^{\text{LDS}}$ out exactly** with the same Kalman trick as the $C{=}0$ side:
+$$\log p(C{=}1) + \underbrace{\log p(z^{\text{EV}*}\mid C{=}1)}_{\text{HMM prior of the path}} + \underbrace{\log p(x\mid z^{\text{EV}*}, \Theta^*, C{=}1)}_{\text{Kalman marginal of the residual}}.$$
+The second term is the HMM prior probability of the chosen state path; the third
+runs the Kalman filter on the residual $x - \Theta^*[z^{\text{EV}*}]$ (with the
+per-cell EV noise added to $R$) so $z^{\text{LDS}}$ is gone. The result is a
+**density over $x$ alone**, hence directly comparable to $\log p(x\mid C{=}0)$.
+It is still approximate — it fixes $z^{\text{EV}}$ and $\Theta$ at point
+estimates instead of integrating them — but it is nearly free (one extra Kalman
+pass) and is exactly the first two terms of the exact estimator below.
+([`lds_loglik_c1_given_zev`](../models/graphical_model/inference.py).)
+
+**(B) Chib (1995) — the exact marginal (up to Monte-Carlo error).** This removes
+A′'s approximation by no longer fixing $z^{\text{EV}}$ and $\Theta$. It rests on
+one rearrangement of Bayes' rule that holds **at any single point $\psi^*$**:
+
+$$p(x\mid C{=}1) = \frac{p(x\mid\psi^*)\,p(\psi^*)}{p(\psi^*\mid x)} \quad\Longrightarrow\quad \log p(x\mid C{=}1) = \underbrace{\log p(x\mid\psi^*)}_{\text{likelihood}} + \underbrace{\log p(\psi^*)}_{\text{prior}} - \underbrace{\log p(\psi^*\mid x)}_{\text{posterior ordinate}}.$$
+
+Read it as: *evidence = likelihood × prior ÷ posterior-density-at-that-point.*
+The likelihood and prior at $\psi^*$ are easy to evaluate directly. The only
+unknown is the **posterior ordinate** $p(\psi^*\mid x)$ — the height of the
+posterior density at $\psi^*$ — which we don't have in closed form. Chib's idea:
+**factor it along the Gibbs blocks** and estimate each factor from samples:
+
+$$\log p(\psi^*\mid x) = \underbrace{\log p(z^{\text{EV}*}\mid x)}_{\text{ord}_{z^{\text{EV}}}} + \underbrace{\log p(\Theta^*\mid x, z^{\text{EV}*})}_{\text{ord}_{\Theta}} + \underbrace{\log p(z^{\text{LDS}*}\mid x, z^{\text{EV}*}, \Theta^*)}_{\text{ord}_{z^{\text{LDS}}}}.$$
+
+Each factor conditions on the blocks **before** it (the Gibbs order
+$z^{\text{EV}}\!\to\!\Theta\!\to\!z^{\text{LDS}}$) and is estimated differently:
+
+- **$\text{ord}_{z^{\text{EV}}} = \log p(z^{\text{EV}*}\mid x)$.** We can compute
+  the *full conditional* $p(z^{\text{EV}*}\mid x, \Theta, z^{\text{LDS}})$ exactly
+  (HMM forward pass), so by Rao–Blackwell we **average that conditional over
+  draws $(\Theta, z^{\text{LDS}})$ from the full posterior** — i.e. over the main
+  Gibbs run (we keep a strided subsample of its draws). Averaging in probability
+  space, in logs, is `logmeanexp`.
+- **$\text{ord}_{\Theta} = \log p(\Theta^*\mid x, z^{\text{EV}*})$.** Now
+  $z^{\text{EV}}$ is **pinned** at $z^{\text{EV}*}$. We run a short **reduced
+  Gibbs** (only $\Theta$ and $z^{\text{LDS}}$ move) and average the
+  truncated-Normal full-conditional density of $\Theta^*$ over those draws.
+- **$\text{ord}_{z^{\text{LDS}}} = \log p(z^{\text{LDS}*}\mid x, z^{\text{EV}*},
+  \Theta^*)$.** With both other blocks fixed this is just a Gaussian — the FFBS
+  smoothing density — evaluated in **closed form**, no sampling
+  ([`kalman_logpdf`](../models/graphical_model/non_ev_lds.py)).
+
+Plugging the three back in gives the exact $\log p(x\mid C{=}1)$, then add
+$\log p_C$ for the evidence. **Built-in sanity check.** The last two pieces obey
+an exact Gaussian identity with no Monte-Carlo error:
+$\log p(x\mid\psi^*) + \log p(z^{\text{LDS}*}) - \text{ord}_{z^{\text{LDS}}}$ must
+reproduce A′'s Kalman-marginal term $\log p(x\mid z^{\text{EV}*}, \Theta^*,
+C{=}1)$. The code computes both and reports their difference $\Delta$, which
+should be $\approx 0$ — a free correctness test on the Kalman/prior/emission
+plumbing. ([`chib_marginal_loglik_c1()`](../models/graphical_model/inference.py);
+enable via `infer_home(..., decision='chib')` or
+`infer_home_c1(..., compute_chib=True)`.)
+
+**In one line.** $C{=}0$ evidence is exact; for $C{=}1$ use **A′** by default
+(comparable, nearly free), and **B/Chib** when you want the exact marginal. The
+density/evidence helpers (`lds_loglik_c0`, `lds_loglik_c1_given_zev`,
+`log_hmm_prior`, `log_lds_prior`, `log_theta_prior`, `log_joint_c1_plugin`) are
+reusable building blocks in
+[`inference.py`](../models/graphical_model/inference.py).
 
 ---
 
@@ -811,29 +685,27 @@ which the Gibbs sampler is compared.
 
 | Symbol | Kind | Fit | Inference | Code |
 |---|---|---|---|---|
-| $C^{(n)}$ | per-home latent | observed | collapsed marginal (default) / mixture | [`infer_home_collapsed()`](../models/graphical_model.py#L1413) / [`infer_home()`](../models/graphical_model.py#L781) |
-| $p_C$ | global scalar | empirical mean | read-only | [`fit()`](../models/graphical_model.py#L264) |
-| $z^{(n)}_{d,t}$ | per-home latent | observed | FFBS (block 1) | [`_ffbs()`](../models/graphical_model.py#L1108) |
-| $\pi_z, P_z$ | global | smoothed counts | read-only | [`_fit_hmm()`](../models/graphical_model.py#L417) |
-| $\Theta^{(n)}_k$ | per-home latent (truncated to $B_k$) | observed | Gibbs block 2 (truncated Gaussian) | [`_sample_theta_k()`](../models/graphical_model.py#L1169) |
-| $\mu_{\Theta_k}, \sigma_{\Theta_k}, \sigma^{\text{EV}}_k$ | global | EM | read-only | [`_fit_charging_em()`](../models/graphical_model.py#L665) |
-| $x^{(n)}_{d,t}$ | observed | observed | observed | [`_build_home_arrays()`](../models/graphical_model.py#L391) |
+| $C^{(n)}$ | per-home latent | observed | evidence comparison $\log p(x,C{=}1)$ vs $\log p(x,C{=}0)$ (§5.1) | [`infer_home()`](../models/graphical_model/inference.py) |
+| $p_C$ | global scalar | empirical mean | $C$ prior in the evidence (§5.1) | [`fit()`](../models/graphical_model/fit.py) |
+| $z^{(n)}_{d,t}$ | per-home latent | observed | FFBS (C=1 Block A); $\equiv\texttt{off}$ if C=0 | [`ev.ffbs()`](../models/graphical_model/ev.py) |
+| $\pi_z, P_z$ | global | smoothed counts | read-only | [`ev.fit_hmm()`](../models/graphical_model/ev.py) |
+| $\Theta^{(n)}_k$ | per-home latent (truncated to $B_k$) | observed | C=1 Block B (truncated Gaussian) | [`ev.sample_theta_k()`](../models/graphical_model/ev.py) |
+| $\mu_{\Theta_k}, \sigma_{\Theta_k}, \sigma^{\text{EV}}_k$ | global | EM | read-only | [`ev.fit_charging_em()`](../models/graphical_model/ev.py) |
+| $x^{(n)}_{d,t}$ | observed | observed | observed | [`build_home_arrays()`](../models/graphical_model/_data.py) |
 
-### 6.2 Non-EV side — current implementation
-
-| Symbol | Kind | Fit | Inference | Code |
-|---|---|---|---|---|
-| $\eta^{(n)}_t$ | per-home latent ($T$-vec) | empirical day-mean | Gibbs block 3 ($T$-dim Gaussian, heteroscedastic) | [`_sample_eta()`](../models/graphical_model.py#L1188) |
-| $\bar\eta_t, W, \psi$ | global ($\Sigma_\eta = WW^\top + \mathrm{diag}(\psi)$) | mean + truncated-eigen FA with bias-correction | read-only | [`_fit_eta_prior()`](../models/graphical_model.py#L542) |
-| $\sigma^{\text{Non-EV}}_t$ *(when `omega_mode='global'`, default)* | global ($T$-vec) | pooled per-$t$ MSE | read-only (fixed) | [`_fit_omega_global()`](../models/graphical_model.py#L516) |
-| $\omega^{(n)}_t$ *(when `omega_mode='hierarchical'`)* | per-home latent ($T$-vec) | empirical per-$t$ var | Gibbs block 4 (slice sample, per-$t$) | [`_sample_omega()`](../models/graphical_model.py#L1237) |
-| $a^\omega_t, b^\omega_t$ *(when `omega_mode='hierarchical'`)* | global ($T$-vec each) | method-of-moments | read-only | [`_fit_omega_prior()`](../models/graphical_model.py#L622) |
-
-### 6.3 Non-EV side — deprecated rank-1 (removed from code)
+### 6.2 Non-EV side — current implementation (LDS)
 
 | Symbol | Kind | Fit | Inference | Code |
 |---|---|---|---|---|
-| $\alpha^{(n)}$ | per-home latent (scalar) | plug-in OLS | (was Gibbs block 3) | removed |
-| $\mu_\alpha, \sigma_\alpha^2$ | global | mean / bias-corrected var | read-only | removed |
-| $\rho_t$ | global ($T$-vec) | top right SVD vector | read-only | removed |
-| $\sigma^{\text{Non-EV}}_t$ | global ($T$-vec) | individual-obs MSE | read-only | (preserved as the `omega_mode='global'` fit, see §6.2) |
+| $z^{\text{LDS},(n)}_{1:D}$ | per-home latent ($D\times L$) | not inferred at fit | C=0: exact RTS smoother · C=1: Kalman FFBS (Block C) | [`sample_z_lds`](../models/graphical_model/non_ev_lds.py), [`rts_smooth`](../models/graphical_model/non_ev_lds.py) |
+| $A, C$ | global ($L\times L$, $T\times L$) | EM (held at $I$ by default) | read-only | [`fit_lds_em`](../models/graphical_model/non_ev_lds.py) |
+| $Q, R, \mu_0, \Sigma_0$ | global | EM (closed-form M-step, projected diagonal) | read-only | [`fit_lds_em`](../models/graphical_model/non_ev_lds.py) |
+
+### 6.3 Non-EV side — deprecated predecessors (removed from code)
+
+| Symbol | Kind | Fit | Model | Status |
+|---|---|---|---|---|
+| $\eta^{(n)}_t$; $\bar\eta, W, \psi$ | per-home $T$-vec; global PPCA prior | empirical day-mean; truncated-eigen FA | static per-home profile (PPCA, §2.4) | removed |
+| $\omega^{(n)}_t$; $a^\omega_t, b^\omega_t$ | per-home $T$-vec; global IG prior | empirical per-$t$ var; method-of-moments | PPCA std profile (§2.4) | removed |
+| $\alpha^{(n)}$; $\mu_\alpha, \sigma_\alpha^2$ | per-home scalar; global | plug-in OLS; mean / bias-corr. var | rank-1 scale (§2.5) | removed |
+| $\rho_t$; $\sigma^{\text{Non-EV}}_t$ | global $T$-vec | top right SVD vector; pooled MSE | rank-1 shape / noise (§2.5) | removed |
