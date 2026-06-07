@@ -113,39 +113,116 @@ class ModelParams:
 
 
 # ---------------------------------------------------------------------------
-# HomeInference — per-home Gibbs output
+# Per-home inference outputs — one container per EV hypothesis, plus the
+# combined comparison result.  See models/graphical_model/inference.py.
 # ---------------------------------------------------------------------------
 
 @dataclass
-class HomeInference:
-    """Per-home output of the Gibbs sampler.
+class HomeInferenceC0:
+    """Exact C=0 (no-EV) inference output.
 
-    Memory note: the per-iter LDS latent z^LDS is (D, T) ≈ 35 000 floats.
-    Storing all S samples would balloon memory, so we instead accumulate the
-    posterior mean (`z_lds_mean`) incrementally and keep only the final-iter
-    sample (`z_lds_last`) for visualization. Same for the predictive Non-EV
-    mean E[C z^LDS_d] — accumulated, not stored per-iter.
+    Under C=0 the only latent is z^LDS, whose posterior is Gaussian and exact
+    (one Kalman smoother call). `log_lik` is the Kalman marginal log p(x | C=0)
+    with z^LDS integrated out; `log_evidence` adds the log(1 - p_C) prior.
     """
     home_id: int
-    C_hat: int
-    z_hat: np.ndarray                            # (D, T) MAP charging states (EV)
+    z_lds_mean:     np.ndarray                   # (D, T) E[C z^LDS | x, C=0]  (obs space)
+    z_lds_cov_diag: np.ndarray                   # (D, T) Var diag of the Non-EV mean per cell
+    log_lik:        float                        # log p(x | C=0)
+    log_evidence:   float                        # log p(x, C=0) = log(1-p_C) + log_lik
 
-    # ---- Per-sample posterior summaries --------------------------------
-    z_marginals:   np.ndarray | None = None      # (D, T, K) p(z_ev | x)
-    theta_samples: np.ndarray | None = None      # (S, K)
-    z_lds_mean:    np.ndarray | None = None      # (D, T) posterior mean of z^LDS (accumulated)
-    z_lds_last:    np.ndarray | None = None      # (D, T) last retained sample of z^LDS
 
-    # ---- Per-sample C draws & helpers ----------------------------------
-    c_samples:                     np.ndarray | None = None    # (S,)  int {0,1}
-    c_from_z_samples:              np.ndarray | None = None    # (S,)  any-nonoff indicator
-    z_transitions_per_day_samples: np.ndarray | None = None    # (S,)  float
+@dataclass
+class HomeInferenceC1:
+    """C=1 (EV) inference output — three-block Gibbs (Theta, z^EV, z^LDS).
+
+    Memory note: the per-iter z^LDS is (D, T) ≈ 35 000 floats; we accumulate the
+    posterior mean (`z_lds_mean`) incrementally and keep only the final retained
+    sample (`z_lds_last`). z^EV samples are retained only if explicitly requested
+    (`z_ev_samples`, needed for the Chib estimator B).
+    """
+    home_id: int
+    z_hat:        np.ndarray                       # (D, T) MAP charging states (EV)
+    z_marginals:  np.ndarray                       # (D, T, K) p(z_ev | x, C=1)
+    theta_samples: np.ndarray                      # (S, K)
+    theta_mean:   np.ndarray                       # (K,)
+    z_lds_mean:   np.ndarray                        # (D, T) posterior mean of C z^LDS (accumulated)
+    z_lds_last:   np.ndarray | None = None          # (D, T) last retained C z^LDS sample
+    z_ev_last:    np.ndarray | None = None          # (D, T) last retained z^EV sample
+    z_lds_star:   np.ndarray | None = None          # (D, T) conditional smoother mean at (z_hat, theta_mean)
+
+    # ---- Model-comparison terms (specs §5) -----------------------------
+    log_joint_plugin:    float = 0.0               # log p(x, z^EV*, z^LDS* | C=1, Θ*)  (A, no C prior)
+    log_evidence_plugin: float = 0.0               # log p(x, C=1) via plug-in joint    (A)
+    log_evidence_rb:     float = 0.0               # log p(x, C=1) with z^LDS integrated (A′; bridge to B)
+    log_evidence_chib:   float | None = None       # log p(x, C=1) exact via Chib        (B; if computed)
+    chib:                "ChibResult | None" = None  # full Chib breakdown (if computed)
 
     # ---- Full iteration traces (burn-in + retained) --------------------
-    theta_trace:    np.ndarray | None = None     # (S_burn+S, K)
-    state_occ_trace:np.ndarray | None = None     # (S_burn+S, K)
-    loglik_trace:   np.ndarray | None = None     # (S_burn+S,)
-    log_Z1_trace:   np.ndarray | None = None     # (S_burn+S,) — collapsed sampler only
-    log_Z0_trace:   np.ndarray | None = None     # (S_burn+S,) — collapsed sampler only
+    theta_trace:     np.ndarray | None = None      # (S_burn+S, K)
+    state_occ_trace: np.ndarray | None = None      # (S_burn+S, K)
+    loglik_trace:    np.ndarray | None = None       # (S_burn+S,)
 
-    S_burn: int = 0                              # number of burn-in iterations
+    # ---- Retained z^EV samples (only if retain_z_ev=True) --------------
+    z_ev_samples: np.ndarray | None = None         # (S, D, T) int8 — for Chib (B)
+
+    S_burn: int = 0                                # number of burn-in iterations
+
+
+@dataclass
+class ChibResult:
+    """Breakdown of the Chib (1995) estimate of log p(x | C=1) (specs §5, B).
+
+    Identity at the high-density point ψ* = (z^EV*, Θ*, z^LDS*), all | C=1:
+
+        log p(x|C=1) = log p(x|ψ*) + log p(ψ*) − log p(ψ*|x)
+
+    with the posterior ordinate split by Gibbs block order (z^EV, Θ, z^LDS):
+
+        log p(ψ*|x) = log p(z^EV*|x) + log p(Θ*|x,z^EV*) + log p(z^LDS*|x,z^EV*,Θ*)
+                      └ ord_zev (main run) ┘ └ ord_theta (reduced) ┘ └ ord_zlds (closed form)
+    """
+    log_lik_star:    float    # log p(x | z^EV*, z^LDS*, Θ*)  (complete-data emission)
+    log_prior_star:  float    # log p(z^EV*) + log p(Θ*) + log p(z^LDS*)
+    ord_zev:         float    # log p(z^EV* | x)               — main-run average
+    ord_theta:       float    # log p(Θ* | x, z^EV*)           — reduced-run average
+    ord_zlds:        float    # log p(z^LDS* | x, z^EV*, Θ*)   — closed-form FFBS density
+    log_lik_c1:      float    # log p(x | C=1) = log_lik_star + log_prior_star − (ords)
+    log_evidence:    float    # log p(x, C=1) = log p_C + log_lik_c1
+    # Cross-check: the Gaussian sub-identity should reproduce lds_loglik_c1_given_zev.
+    lds_marg_direct: float    # lds_loglik_c1_given_zev(x, z^EV*, Θ*)
+    lds_marg_via_chib: float  # log_lik_star + log p(z^LDS*) − ord_zlds  (should ≈ direct)
+
+
+@dataclass
+class HomeResult:
+    """Combined per-home result: both tracks + the C=0 vs C=1 comparison.
+
+    Exposes `.z_hat` / `.z_marginals` (from the C=1 track, for z-state evaluation)
+    and `.c_prob` (soft P(C=1 | x) from the two evidences) so the evaluation code
+    can treat it like the old single-track output.
+    """
+    home_id: int
+    c0: HomeInferenceC0
+    c1: HomeInferenceC1
+    C_hat: int                                     # argmax of the two evidences
+    log_evidence_c0: float
+    log_evidence_c1: float                         # the estimate used for the decision
+    decision: str = "rb"                           # which C=1 estimate drove the decision
+
+    @property
+    def z_hat(self) -> np.ndarray:
+        """MAP charging states from the C=1 track (charging-state recovery)."""
+        return self.c1.z_hat
+
+    @property
+    def z_marginals(self) -> np.ndarray:
+        return self.c1.z_marginals
+
+    @property
+    def c_prob(self) -> float:
+        """Soft P(C=1 | x) = softmax over the two log-evidences."""
+        m = max(self.log_evidence_c0, self.log_evidence_c1)
+        w0 = np.exp(self.log_evidence_c0 - m)
+        w1 = np.exp(self.log_evidence_c1 - m)
+        return float(w1 / (w0 + w1))

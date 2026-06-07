@@ -36,15 +36,25 @@ from .evaluation import evaluate, format_confusion, print_evaluation
 from .fit import fit
 from .inference import (
     build_heuristic_homes,
+    chib_marginal_loglik_c1,
     compute_loglik,
     compute_loglik_c0,
-    infer_all_collapsed,
-    infer_home_collapsed,
+    infer_all,
+    infer_home,
+    infer_home_c0,
+    infer_home_c1,
+    lds_loglik_c0,
+    lds_loglik_c1_given_zev,
+    log_hmm_prior,
+    log_joint_c1_plugin,
+    log_lds_prior,
+    log_theta_prior,
 )
 from .non_ev_lds import (
     LDSParams,
     fit_lds_em,
     kalman_filter,
+    kalman_logpdf,
     kalman_sample,
     rts_smooth,
     sample_z_lds,
@@ -59,22 +69,28 @@ from .params import (
     T,
     THETA_BOUNDS,
     THETA_VAR_FLOOR,
-    HomeInference,
+    ChibResult,
+    HomeInferenceC0,
+    HomeInferenceC1,
+    HomeResult,
     ModelParams,
 )
 
 __all__ = [
     # Public dataclasses / constants
-    "ModelParams", "HomeInference", "LDSParams",
-    "STATE_NAMES", "T", "K", "THETA_BOUNDS",
+    "ModelParams", "HomeInferenceC0", "HomeInferenceC1", "HomeResult", "ChibResult",
+    "LDSParams", "STATE_NAMES", "T", "K", "THETA_BOUNDS",
     # Fit
     "fit", "fit_lds_em",
-    # Inference
-    "infer_home_collapsed", "infer_all_collapsed",
+    # Inference — two-track (C=0 exact, C=1 Gibbs) + comparison
+    "infer_home", "infer_all", "infer_home_c0", "infer_home_c1",
     "compute_loglik", "compute_loglik_c0",
+    "lds_loglik_c0", "lds_loglik_c1_given_zev",
+    "log_hmm_prior", "log_lds_prior", "log_joint_c1_plugin", "log_theta_prior",
+    "chib_marginal_loglik_c1",
     "build_heuristic_homes",
     # LDS internals (useful in validation notebooks)
-    "kalman_filter", "rts_smooth", "kalman_sample", "sample_z_lds",
+    "kalman_filter", "rts_smooth", "kalman_sample", "kalman_logpdf", "sample_z_lds",
     # Evaluation
     "evaluate", "print_evaluation", "format_confusion",
 ]

@@ -351,6 +351,51 @@ def kalman_sample(
     return z_sample
 
 
+def kalman_logpdf(
+    params:   LDSParams,
+    obs:      np.ndarray,                  # (D, M)
+    z_seq:    np.ndarray,                  # (D, L) — the sequence to score
+    *,
+    extra_obs_cov: np.ndarray | None = None,
+) -> float:
+    """log p(z_seq | obs) under the LDS posterior — the FFBS density evaluated.
+
+    The smoothing posterior factorises backward exactly as `kalman_sample` draws:
+
+        p(z_{1:D} | x) = p(z_D | x) · Π_{d<D} p(z_d | z_{d+1}, x)
+
+    each factor Gaussian with the same (mean, cov) `kalman_sample` uses. We sum
+    the Gaussian log-densities of the *given* z_seq under those factors. Used by
+    the Chib estimator to evaluate the z^LDS posterior ordinate (inference.py).
+    """
+    fr   = kalman_filter(params, obs, extra_obs_cov=extra_obs_cov)
+    A    = params.A
+    D, L = fr.z_filt.shape
+
+    lp = _mvn_logpdf(z_seq[D-1], fr.z_filt[D-1], fr.P_filt[D-1])
+    for d in range(D - 2, -1, -1):
+        P_pred_next = fr.P_pred[d+1]
+        J = fr.P_filt[d] @ A.T @ np.linalg.inv(P_pred_next)
+        m_cond = fr.z_filt[d] + J @ (z_seq[d+1] - fr.z_pred[d+1])
+        V_cond = fr.P_filt[d] - J @ P_pred_next @ J.T
+        V_cond = 0.5 * (V_cond + V_cond.T)
+        lp += _mvn_logpdf(z_seq[d], m_cond, V_cond)
+    return float(lp)
+
+
+def _mvn_logpdf(x: np.ndarray, mean: np.ndarray, cov: np.ndarray) -> float:
+    """log N(x; mean, cov) via Cholesky. Tolerates mildly-PSD cov via jitter."""
+    L = mean.shape[0]
+    try:
+        chol = np.linalg.cholesky(cov)
+    except np.linalg.LinAlgError:
+        chol = np.linalg.cholesky(cov + 1e-10 * np.eye(L))
+    y = np.linalg.solve(chol, x - mean)
+    return float(-0.5 * (L * np.log(2 * np.pi)
+                         + 2 * np.log(np.diag(chol)).sum()
+                         + y @ y))
+
+
 def _sample_mvn(mean: np.ndarray, cov: np.ndarray, rng) -> np.ndarray:
     """Draw one sample from N(mean, cov). Tolerates mildly-PSD inputs via jitter."""
     L = mean.shape[0]

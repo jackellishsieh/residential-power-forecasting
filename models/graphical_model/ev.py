@@ -229,13 +229,31 @@ def sample_theta_k(
     latents — under the LDS model this is (C z^LDS)[d, t].  `nonev_var` is the
     per-t Non-EV emission variance — diag(R) under the LDS model.
     """
+    m, sd, lb, ub = theta_k_posterior_params(x, z, nonev_mean, nonev_var, params, k)
+    return _truncnorm_sample(m, sd, lb, ub, rng)
+
+
+def theta_k_posterior_params(
+    x:          np.ndarray,    # (D, T)
+    z:          np.ndarray,    # (D, T)
+    nonev_mean: np.ndarray,    # (D, T)
+    nonev_var:  np.ndarray,    # (T,)
+    params: ModelParams,
+    k:      int,
+) -> tuple[float, float, float, float]:
+    """Conditional truncated-Normal posterior params (mean, sd, lb, ub) for Theta_k.
+
+    The closed form behind `sample_theta_k`, exposed so the Chib estimator
+    (inference.py) can evaluate the same full-conditional *density* at a point.
+    With no z=k cells the conditional reduces to the truncated prior.
+    """
     sigma2_ev_k = params.sigma2_ev[k]
     sig2_prior  = max(params.sigma2_theta[k], THETA_VAR_FLOOR)
     lb, ub      = THETA_BOUNDS[k]
 
     mask = (z == k)
-    if not mask.any():                                    # no obs in state k: draw from truncated prior
-        return _truncnorm_sample(params.mu_theta[k], np.sqrt(sig2_prior), lb, ub, rng)
+    if not mask.any():                                    # no obs in state k: truncated prior
+        return float(params.mu_theta[k]), float(np.sqrt(sig2_prior)), lb, ub
 
     var_t     = sigma2_ev_k + nonev_var                   # (T,) heteroscedastic per t
     inv_var_t = 1.0 / var_t
@@ -247,7 +265,7 @@ def sample_theta_k(
 
     prec = 1.0 / sig2_prior + S_inv_var
     m    = (params.mu_theta[k] / sig2_prior + S_r) / prec
-    return _truncnorm_sample(m, np.sqrt(1.0 / prec), lb, ub, rng)
+    return float(m), float(np.sqrt(1.0 / prec)), lb, ub
 
 
 def _truncnorm_sample(mean: float, sd: float, lb: float, ub: float, rng) -> float:
@@ -287,14 +305,7 @@ def hmm_forward(
              that the collapsed C-step uses.
     """
     D = x.shape[0]
-    combined_var = params.sigma2_ev[:, None] + nonev_var[None, :]   # (K, T)
-    inv_2var     = 0.5 / combined_var
-    log_norm     = -0.5 * np.log(2 * np.pi * combined_var)
-
-    # Emission mean is theta[k] + nonev_mean[d,t]; broadcast to (D, T, K)
-    mean_dtk = nonev_mean[:, :, None] + theta[None, None, :]
-    diff     = x[:, :, None] - mean_dtk
-    log_emit = log_norm.T[None, :, :] - diff ** 2 * inv_2var.T[None, :, :]  # (D, T, K)
+    log_emit = _log_emissions(x, theta, nonev_mean, nonev_var, params)  # (D, T, K)
 
     log_f  = np.empty((D, T, K), dtype=np.float64)
     log_Z1 = 0.0
@@ -314,6 +325,65 @@ def hmm_forward(
         log_f[:, t, :] = unnorm_t - lse_t[:, None]
 
     return log_f, log_Z1
+
+
+def _log_emissions(
+    x:          np.ndarray,   # (D, T)
+    theta:      np.ndarray,   # (K,)
+    nonev_mean: np.ndarray,   # (D, T)
+    nonev_var:  np.ndarray,   # (T,)
+    params: ModelParams,
+) -> np.ndarray:
+    """Per-cell, per-state Gaussian emission log-density → (D, T, K):
+
+        log N( x[d,t] ; theta[k] + nonev_mean[d,t], sigma2_ev[k] + nonev_var[t] )
+    """
+    combined_var = params.sigma2_ev[:, None] + nonev_var[None, :]   # (K, T)
+    inv_2var     = 0.5 / combined_var
+    log_norm     = -0.5 * np.log(2 * np.pi * combined_var)
+    mean_dtk = nonev_mean[:, :, None] + theta[None, None, :]
+    diff     = x[:, :, None] - mean_dtk
+    return log_norm.T[None, :, :] - diff ** 2 * inv_2var.T[None, :, :]
+
+
+def hmm_marginals(
+    x:          np.ndarray,   # (D, T)
+    theta:      np.ndarray,   # (K,)
+    nonev_mean: np.ndarray,   # (D, T)
+    nonev_var:  np.ndarray,   # (T,)
+    params: ModelParams,
+    log_pi: np.ndarray,
+    log_P:  np.ndarray,
+) -> np.ndarray:
+    """Smoothed per-cell state marginals γ_{d,t}(k) = p(z_{d,t}=k | x, Θ, z^LDS).
+
+    Standard HMM forward-backward in log-space, vectorised over days. Returns a
+    (D, T, K) array whose last axis sums to 1 — the "fuzzy posterior" over the
+    charging state at each cell, of which the FFBS draw is one sample.
+    """
+    D = x.shape[0]
+    log_emit = _log_emissions(x, theta, nonev_mean, nonev_var, params)   # (D, T, K)
+
+    # Forward (normalised) — same recursion as hmm_forward.
+    log_f = np.empty((D, T, K), dtype=np.float64)
+    unnorm = log_pi[None, :] + log_emit[:, 0, :]
+    log_f[:, 0, :] = unnorm - logsumexp(unnorm, axis=1)[:, None]
+    for t in range(1, T):
+        log_pred = logsumexp(log_f[:, t-1, :, None] + log_P[None, :, :], axis=1)
+        unnorm   = log_emit[:, t, :] + log_pred
+        log_f[:, t, :] = unnorm - logsumexp(unnorm, axis=1)[:, None]
+
+    # Backward messages β in log-space (β_{T-1} = 0).
+    log_b = np.zeros((D, T, K), dtype=np.float64)
+    for t in range(T - 2, -1, -1):
+        # log_b[:, t, k] = logsumexp_k' ( log_P[k,k'] + emit_{t+1}(k') + log_b[:, t+1, k'] )
+        tmp = (log_P[None, :, :]
+               + (log_emit[:, t+1, :] + log_b[:, t+1, :])[:, None, :])      # (D, K, K')
+        log_b[:, t, :] = logsumexp(tmp, axis=2)
+
+    log_gamma = log_f + log_b
+    log_gamma -= logsumexp(log_gamma, axis=2, keepdims=True)
+    return np.exp(log_gamma)
 
 
 def hmm_backward_sample(log_f: np.ndarray, params: ModelParams, rng) -> np.ndarray:

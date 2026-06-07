@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .params import HomeInference, K, STATE_NAMES, T
+from .params import HomeResult, K, STATE_NAMES, T
 
 
 # ===========================================================================
@@ -24,7 +24,7 @@ from .params import HomeInference, K, STATE_NAMES, T
 
 def evaluate(
     df: pd.DataFrame,
-    inferences: dict[int, HomeInference],
+    inferences: dict[int, HomeResult],
     c_prob_methods: dict[str, dict[int, float]] | None = None,
     heuristic_states: dict[int, np.ndarray] | None = None,
 ) -> dict:
