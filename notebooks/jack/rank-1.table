@@ -1,0 +1,59 @@
+
+────────────────────────────────────────────────────────────────
+z confusion — EV homes (C_true=1)  (N=0 homes)
+  Aggregation: per-home row-normalised CM, then mean over 0 homes
+  Rows = true state, columns = predicted state
+
+────────────────────────────────────────────────────────────────
+z confusion — non-EV homes (C_true=0)  (N=0 homes)
+  Aggregation: per-home row-normalised CM, then mean over 0 homes
+  Rows = true state, columns = predicted state
+  Note: rows 'low' and 'high' are NaN (no ground-truth examples)
+
+────────────────────────────────────────────────────────────────
+C confusion — method: gibbs
+  Aggregation: row-normalised CM averaged over 18 homes
+  (3 EV, 15 non-EV)  accuracy=0.1667
+  Rows = true C, columns = predicted C
+
+  [hard (threshold 0.5)]
+              no-EV       EV
+  no-EV      0.000    1.000
+  EV         0.000    1.000
+
+  [soft (P̂ as fraction)]
+              no-EV       EV
+  no-EV      0.020    0.980
+  EV         0.000    1.000
+
+────────────────────────────────────────────────────────────────
+C confusion — method: baseline
+  Aggregation: row-normalised CM averaged over 18 homes
+  (3 EV, 15 non-EV)  accuracy=1.0000
+  Rows = true C, columns = predicted C
+
+  [hard (threshold 0.5)]
+              no-EV       EV
+  no-EV      1.000    0.000
+  EV         0.000    1.000
+
+  [soft (P̂ as fraction)]
+              no-EV       EV
+  no-EV      0.786    0.214
+  EV         0.192    0.808
+
+────────────────────────────────────────────────────────────────
+C confusion — method: map_z+heuristic
+  Aggregation: row-normalised CM averaged over 18 homes
+  (3 EV, 15 non-EV)  accuracy=0.1667
+  Rows = true C, columns = predicted C
+
+  [hard (threshold 0.5)]
+              no-EV       EV
+  no-EV      0.000    1.000
+  EV         0.000    1.000
+
+  [soft (P̂ as fraction)]
+              no-EV       EV
+  no-EV      0.041    0.959
+  EV         0.000    1.000
