@@ -18,6 +18,24 @@ meta = pd.read_csv(META_PATH).set_index("dataid")["has_car"]
 RELABEL_NON_EV = {2335}
 DROP = {9278}
 
+
+def longest_contiguous_block(dates):
+    """Return the subset of dates forming the longest contiguous calendar run."""
+    dates = sorted(set(dates))
+    if not dates:
+        return set()
+    best_start, best_len = 0, 1
+    cur_start, cur_len = 0, 1
+    for i in range(1, len(dates)):
+        if (dates[i] - dates[i - 1]).days == 1:
+            cur_len += 1
+        else:
+            cur_start, cur_len = i, 1
+        if cur_len > best_len:
+            best_start, best_len = cur_start, cur_len
+    return set(dates[best_start : best_start + best_len])
+
+
 dataset = {}
 for city in CITIES:
     print(f"Processing {city}...", flush=True)
@@ -48,8 +66,9 @@ for city in CITIES:
         required = ["load", "car1", "non_ev_load"] if has_car else ["load", "non_ev_load"]
         dates = home_df.index.normalize()
         valid_days = home_df.groupby(dates)[required].apply(lambda g: g.notna().all().all())
-        valid_days = valid_days[valid_days].index
-        home_df = home_df[home_df.index.normalize().isin(valid_days)]
+        valid_days_dates = [d.date() for d in valid_days[valid_days].index]
+        keep_dates = longest_contiguous_block(valid_days_dates)
+        home_df = home_df[np.array([d in keep_dates for d in home_df.index.tz_convert(CITY_TZ[city]).date])]
 
         local_idx = home_df.index.tz_convert(CITY_TZ[city])
         local_dates = np.array(local_idx.date)

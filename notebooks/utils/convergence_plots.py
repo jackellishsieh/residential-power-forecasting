@@ -55,13 +55,29 @@ def _eta_mean_trace(inference) -> np.ndarray:
 
 
 def _post_burnin_chains(inference) -> dict[str, np.ndarray]:
-    """Extract named post-burn-in scalar chains from a HomeInference object."""
+    """Extract named post-burn-in scalar chains from a HomeInference object.
+
+    Supports both old (alpha_trace) and new (eta_trace) model schemas.
+    """
     S_burn = inference.S_burn
+<<<<<<< HEAD
+    chains = {}
+    # Background scalar: old model has alpha_trace (1-D), new has eta_trace (2-D, T)
+    if getattr(inference, "alpha_trace", None) is not None:
+        chains["α"] = inference.alpha_trace[S_burn:]
+    elif getattr(inference, "eta_trace", None) is not None:
+        chains["η̄ (mean)"] = inference.eta_trace[S_burn:].mean(axis=1)
+    if getattr(inference, "theta_trace", None) is not None:
+        chains["Θ_low"]  = inference.theta_trace[S_burn:, 1]
+        chains["Θ_high"] = inference.theta_trace[S_burn:, 2]
+    return chains
+=======
     return {
         "mean(η)": _eta_mean_trace(inference)[S_burn:],
         "Θ_low":   inference.theta_trace[S_burn:, 1],
         "Θ_high":  inference.theta_trace[S_burn:, 2],
     }
+>>>>>>> 73e2f681f94273d1e7820a47df3d7586d1f5cd73
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,8 +91,19 @@ def plot_scalar_traces(inference, *, figure_width: float = 12.0) -> Figure:
     The running posterior mean (computed over retained samples only) is
     overlaid so it's easy to see whether it has stabilised.
     """
+<<<<<<< HEAD
+    # Support both old (alpha_trace) and new (eta_trace) schemas
+    if getattr(inference, "alpha_trace", None) is not None:
+        bg_label, bg_trace = "α", inference.alpha_trace
+    else:
+        bg_label = "η̄ (mean)"
+        bg_trace = inference.eta_trace.mean(axis=1)
+
+    n_total = len(bg_trace)
+=======
     eta_mean_trace = _eta_mean_trace(inference)
     n_total = len(eta_mean_trace)
+>>>>>>> 73e2f681f94273d1e7820a47df3d7586d1f5cd73
     S_burn  = inference.S_burn
     S       = n_total - S_burn
     iters   = np.arange(1, n_total + 1)
@@ -84,9 +111,15 @@ def plot_scalar_traces(inference, *, figure_width: float = 12.0) -> Figure:
     fig, axes = plt.subplots(3, 1, figsize=(figure_width, 7), sharex=True)
 
     scalar_info = [
+<<<<<<< HEAD
+        (bg_label, bg_trace,                      "steelblue"),
+        ("Θ_low",  inference.theta_trace[:, 1],   STATE_COLORS[1]),
+        ("Θ_high", inference.theta_trace[:, 2],   STATE_COLORS[2]),
+=======
         ("mean(η)", eta_mean_trace,                "steelblue"),
         ("Θ_low",   inference.theta_trace[:, 1],   STATE_COLORS[1]),
         ("Θ_high",  inference.theta_trace[:, 2],   STATE_COLORS[2]),
+>>>>>>> 73e2f681f94273d1e7820a47df3d7586d1f5cd73
     ]
 
     for ax, (label, trace, color) in zip(axes, scalar_info):
@@ -167,7 +200,11 @@ def plot_loglik_trace(inference, *, figure_width: float = 12.0) -> Figure:
     ax.plot(iters, smoothed, color="crimson", lw=1.5, label=f"rolling mean (w={window})")
 
     ax.set_xlabel("Gibbs iteration", fontsize=9)
+<<<<<<< HEAD
+    ax.set_ylabel("log p(x | z, θ, η, ω²)", fontsize=9)
+=======
     ax.set_ylabel("log p(x | z, Θ, η, ω)", fontsize=9)
+>>>>>>> 73e2f681f94273d1e7820a47df3d7586d1f5cd73
     ax.set_title(f"Home {inference.home_id}: complete-data log-likelihood", fontsize=10)
     ax.legend(fontsize=8)
     ax.grid(axis="y", lw=0.3, alpha=0.4)
